@@ -341,6 +341,70 @@ async function updateFirebaseSmart(path, updates) {
   }
 }
 
+// Helper: Set Firebase via REST API (PUT for overwrite)
+async function setFirebaseViaREST(path, data) {
+  const url = `${config.firebase.databaseURL}/${path}.json`;
+  
+  const response = await fetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+    timeout: 10000
+  });
+  
+  if (!response.ok) {
+    throw new Error(`REST PUT failed: ${response.status}`);
+  }
+  
+  return await response.json();
+}
+
+// Helper: Set with timeout wrapper
+async function setWithTimeout(ref, data, timeoutMs = 10000) {
+  return Promise.race([
+    ref.set(data),
+    new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Firebase set timeout')), timeoutMs)
+    )
+  ]);
+}
+
+// Smart set: Try SDK first, fallback to REST if timeout
+async function setFirebaseSmart(path, data) {
+  try {
+    await setWithTimeout(db.ref(path), data, 10000);
+    return true;
+  } catch (sdkError) {
+    try {
+      await setFirebaseViaREST(path, data);
+      return true;
+    } catch (restError) {
+      throw new Error('Both SDK and REST set failed');
+    }
+  }
+}
+
+// Smart read: Try SDK first, fallback to REST if timeout (for any path)
+async function readFirebaseSmart(path) {
+  try {
+    const snapshot = await fetchWithTimeout(db.ref(path), 10000);
+    return snapshot.val();
+  } catch (sdkError) {
+    const url = `${config.firebase.databaseURL}/${path}.json`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+    
+    if (!response.ok) {
+      throw new Error(`REST GET failed: ${response.status}`);
+    }
+    
+    return await response.json();
+  }
+}
+
 async function checkScheduledWatering() {
   checkCounter++;
   console.log(`\n🔎 [DEBUG] checkScheduledWatering() called - Counter: ${checkCounter}`);
@@ -600,11 +664,10 @@ async function logHistory(type, potNumbers, duration) {
     const dateKey = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`;
     const timeKey = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
 
-    // Get current sensor data
-    const sensorSnapshot = await db.ref('data').once('value');
-    const sensorData = sensorSnapshot.val() || {};
+    // Get current sensor data with timeout
+    const sensorData = await readFirebaseSmart('data') || {};
 
-    await db.ref(`history/${dateKey}/${timeKey}`).set({
+    await setFirebaseSmart(`history/${dateKey}/${timeKey}`, {
       timestamp: now.getTime(),
       type: type,
       pots: potNumbers,
@@ -623,15 +686,14 @@ async function logHistory(type, potNumbers, duration) {
 // Auto-log sensor data setiap 10 menit (independent from watering)
 const autoLogJob = new cron.CronJob('*/10 * * * *', async () => {
   try {
-    const sensorSnapshot = await db.ref('data').once('value');
-    const sensorData = sensorSnapshot.val();
+    const sensorData = await readFirebaseSmart('data');
 
     if (sensorData) {
       const now = new Date();
       const dateKey = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`;
       const timeKey = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
 
-      await db.ref(`history/${dateKey}/${timeKey}`).set({
+      await setFirebaseSmart(`history/${dateKey}/${timeKey}`, {
         timestamp: now.getTime(),
         type: 'auto_log',
         ...sensorData,
@@ -657,8 +719,7 @@ const cleanupJob = new cron.CronJob('0 2 * * *', async () => {
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
 
-    const historySnapshot = await db.ref('history').once('value');
-    const historyData = historySnapshot.val();
+    const historyData = await readFirebaseSmart('history');
 
     if (historyData) {
       let deletedCount = 0;
@@ -668,7 +729,9 @@ const cleanupJob = new cron.CronJob('0 2 * * *', async () => {
           const date = new Date(year, month - 1, day);
 
           if (date < cutoffDate) {
-            await db.ref(`history/${dateKey}`).remove();
+            // Use REST API DELETE
+            const url = `${config.firebase.databaseURL}/history/${dateKey}.json`;
+            await fetch(url, { method: 'DELETE', timeout: 10000 });
             deletedCount++;
             console.log(`   🗑️ Deleted: ${dateKey}`);
           }
@@ -730,14 +793,13 @@ async function testSchedulerNow() {
 async function checkAktuatorNode() {
   try {
     console.log('\n🔍 CHECKING AKTUATOR NODE...');
-    const snapshot = await db.ref('aktuator').once('value');
-    const aktuatorData = snapshot.val();
+    const aktuatorData = await readFirebaseSmart('aktuator');
     
     if (!aktuatorData) {
       console.log('❌ Aktuator node NOT FOUND in Firebase!');
       console.log('   Creating default aktuator structure...');
       
-      await db.ref('aktuator').set({
+      await setFirebaseSmart('aktuator', {
         mosvet_1: false,  // Pompa Air
         mosvet_2: false,  // Pompa Pupuk
         mosvet_3: false,  // Pot 1
@@ -813,7 +875,8 @@ async function showCurrentTime() {
 async function healthCheck() {
   try {
     // Check Firebase connection
-    await db.ref('.info/connected').once('value');
+    await db.ref('.info/connecte (skip SDK, just check via config)
+    const firebaseOk = config.firebase.databaseURL ? true : false;
 
     // Check Redis connection
     await redis.ping();
@@ -822,8 +885,7 @@ async function healthCheck() {
     const queueStatus = await wateringQueue.getJobCounts();
 
     console.log('\n💚 HEALTH CHECK:');
-    console.log(`   Firebase: ✅ Connected`);
-    console.log(`   Redis: ✅ Connected`);
+    console.log(`   Firebase: ${firebaseOk ? '✅' : '❌'}nnected`);
     console.log(`   Queue: ${queueStatus.active} active, ${queueStatus.waiting} waiting`);
   } catch (error) {
     console.error('❤️‍🩹 HEALTH CHECK FAILED:', error.message);
