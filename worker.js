@@ -157,13 +157,9 @@ const wateringWorker = new Worker(
       console.log('   📌 Firebase path: aktuator');
       console.log('   📝 Updates:', JSON.stringify(updates, null, 2));
       
-      const updateResult = await db.ref('aktuator').update(updates);
-      console.log('   ✅ Firebase update successful');
+      await updateFirebaseSmart('aktuator', updates);
       
-      // Verify update
-      const verifySnapshot = await db.ref('aktuator').once('value');
-      const aktuatorState = verifySnapshot.val();
-      console.log('   🔍 Verified aktuator state:', JSON.stringify(aktuatorState, null, 2));
+      // (Verification skipped to avoid SDK timeout - update success already logged above)
 
       // Wait for duration with progress logging
       const startTime = Date.now();
@@ -183,8 +179,7 @@ const wateringWorker = new Worker(
         offUpdates[key] = false;
       }
       console.log('   🔴 Turning OFF:', Object.keys(offUpdates).join(', '));
-      await db.ref('aktuator').update(offUpdates);
-      console.log('   ✅ Aktuators turned OFF successfully');
+      await updateFirebaseSmart('aktuator', offUpdates);
 
       // Log history
       await logHistory(type, potNumbers, duration);
@@ -201,7 +196,7 @@ const wateringWorker = new Worker(
 
       // Safety: Turn OFF everything
       try {
-        await db.ref('aktuator').update({
+        await updateFirebaseSmart('aktuator', {
           mosvet_1: false,
           mosvet_2: false,
           mosvet_3: false,
@@ -290,6 +285,58 @@ async function fetchKontrolSmart() {
     } catch (restError) {
       console.error('   ❌ REST API also failed:', restError.message);
       throw new Error('Both SDK and REST API failed');
+    }
+  }
+}
+
+// Helper: Update Firebase via REST API (PATCH for merge update)
+async function updateFirebaseViaREST(path, updates) {
+  const url = `${config.firebase.databaseURL}/${path}.json`;
+  console.log(`   [DEBUG] REST API PATCH: ${url}`);
+  
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+    timeout: 10000
+  });
+  
+  if (!response.ok) {
+    throw new Error(`REST PATCH failed: ${response.status}`);
+  }
+  
+  const result = await response.json();
+  console.log('   [DEBUG] REST API update successful!');
+  return result;
+}
+
+// Helper: Update with timeout wrapper
+async function updateWithTimeout(ref, updates, timeoutMs = 10000) {
+  return Promise.race([
+    ref.update(updates),
+    new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Firebase update timeout')), timeoutMs)
+    )
+  ]);
+}
+
+// Smart update: Try SDK first, fallback to REST if timeout
+async function updateFirebaseSmart(path, updates) {
+  try {
+    console.log(`   [DEBUG] Attempting SDK update to ${path}...`);
+    await updateWithTimeout(db.ref(path), updates, 10000);
+    console.log('   ✅ Firebase SDK update successful');
+    return true;
+  } catch (sdkError) {
+    console.warn(`   ⚠️  SDK update failed, trying REST API...`);
+    
+    try {
+      await updateFirebaseViaREST(path, updates);
+      console.log('   ✅ Firebase REST update successful');
+      return true;
+    } catch (restError) {
+      console.error('   ❌ REST update also failed:', restError.message);
+      throw new Error('Both SDK and REST update failed');
     }
   }
 }
@@ -718,7 +765,7 @@ async function checkAktuatorNode() {
         
         const updates = {};
         missing.forEach(key => updates[key] = false);
-        await db.ref('aktuator').update(updates);
+        await updateFirebaseSmart('aktuator', updates);
         
         console.log('✅ Missing mosvets added');
       }
