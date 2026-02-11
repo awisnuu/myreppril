@@ -357,18 +357,33 @@ async function checkScheduledWatering() {
     }
   } catch (error) {
     console.error('❌ Error checking scheduled watering:', error.message);
+    console.error('Stack trace:', error.stack);
+    // Continue running - don't crash worker
   }
 }
 
 // Run check setiap 60 detik
-setInterval(checkScheduledWatering, config.worker.checkInterval);
+setInterval(async () => {
+  try {
+    await checkScheduledWatering();
+  } catch (error) {
+    console.error('❌ Error in scheduled check interval:', error.message);
+    console.error(error.stack);
+  }
+}, config.worker.checkInterval);
 console.log(`✅ Waktu Mode scheduler started (check every ${config.worker.checkInterval / 1000}s)`);
 
-// Jalankan check pertama kali setelah 5 detik (jangan tunggu 60 detik)
-setTimeout(() => {
-  console.log('🚀 Running first schedule check immediately...');
-  checkScheduledWatering();
-}, 5000);
+// Jalankan check pertama kali setelah 8 detik (setelah diagnostic selesai)
+setTimeout(async () => {
+  try {
+    console.log('\n🚀 Running first schedule check immediately...');
+    await checkScheduledWatering();
+    console.log('✅ First check completed successfully');
+  } catch (error) {
+    console.error('❌ First check failed:', error.message);
+    console.error(error.stack);
+  }
+}, 8000);
 
 // ==================== SENSOR MODE (THRESHOLD MONITORING) ====================
 
@@ -785,12 +800,17 @@ setTimeout(async () => {
 
 // Run diagnostic checks on startup
 setTimeout(async () => {
-  console.log('\n🔧 RUNNING DIAGNOSTIC CHECKS...');
-  await showCurrentTime();
-  await checkAktuatorNode();
-  console.log('\n✅ Diagnostic checks completed');
-  console.log('\n💡 TIP: To test scheduler manually, check the logs above for current time');
-  console.log('   Then set waktu_1 or waktu_2 in Firebase to match current time + 1 minute');
+  try {
+    console.log('\n🔧 RUNNING DIAGNOSTIC CHECKS...');
+    await showCurrentTime();
+    await checkAktuatorNode();
+    console.log('\n✅ Diagnostic checks completed');
+    console.log('\n💡 TIP: To test scheduler manually, check the logs above for current time');
+    console.log('   Then set waktu_1 or waktu_2 in Firebase to match current time + 1 minute');
+  } catch (error) {
+    console.error('❌ Diagnostic checks failed:', error.message);
+    console.error(error.stack);
+  }
 }, 5000);
 
 // Auto-run test scheduler setiap 10 menit untuk memastikan worker alive
