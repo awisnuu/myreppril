@@ -371,12 +371,12 @@ async function updateFirebaseSmart(path, updates) {
 async function setFirebaseViaREST(path, data) {
   const url = `${config.firebase.databaseURL}/${path}.json`;
   
-  const response = await fetch(url, {
-    method: 'PUT',WithTimeout2(url, {
+  const response = await fetchWithTimeout2(url, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
-  }, 10000
+  }, 10000);
+  
   if (!response.ok) {
     throw new Error(`REST PUT failed: ${response.status}`);
   }
@@ -425,11 +425,11 @@ async function readFirebaseSmart(path) {
     return snapshot.val();
   } catch (sdkError) {
     const url = `${config.firebase.databaseURL}/${path}.json`;
-    const response = await fetch(url, {
-      method: 'GET',WithTimeout2(url, {
+    const response = await fetchWithTimeout2(url, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' }
-    }, 10000
+    }, 10000);
+    
     if (!response.ok) {
       throw new Error(`REST GET failed: ${response.status}`);
     }
