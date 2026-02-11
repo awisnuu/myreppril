@@ -233,14 +233,26 @@ async function checkScheduledWatering() {
     const snapshot = await db.ref('kontrol').once('value');
     const kontrolConfig = snapshot.val();
 
-    if (!kontrolConfig || !kontrolConfig.waktu) {
-      // Waktu mode disabled - no log to reduce noise
-      return;
-    }
-
+    // 🔍 DEBUGGING: Selalu log waktu server vs Firebase untuk monitor sync
     const now = new Date();
     const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
     const dateKey = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`;
+    
+    // Log setiap 5 menit untuk monitoring (menit habis dibagi 5)
+    if (now.getMinutes() % 5 === 0 && now.getSeconds() < 60) {
+      console.log(`\n⏰ TIME CHECK: ${dateKey} ${currentTime} (${now.toLocaleString('id-ID', {timeZone: 'Asia/Jakarta'})})`);
+      console.log(`   Mode Waktu: ${kontrolConfig?.waktu ? '✅ ENABLED' : '❌ DISABLED'}`);
+      if (kontrolConfig?.waktu) {
+        console.log(`   Jadwal 1: ${kontrolConfig.waktu_1 || 'not set'} (${kontrolConfig.waktu_1 === currentTime ? '🔔 MATCH!' : 'no match'})`);
+        console.log(`   Jadwal 2: ${kontrolConfig.waktu_2 || 'not set'} (${kontrolConfig.waktu_2 === currentTime ? '🔔 MATCH!' : 'no match'})`);
+      }
+    }
+
+    if (!kontrolConfig || !kontrolConfig.waktu) {
+      // Waktu mode disabled
+      return;
+    }
+
     if (kontrolConfig.waktu_1 && kontrolConfig.waktu_1 === currentTime) {
       const scheduleKey = `jadwal_1_${dateKey}_${currentTime}`;
 
@@ -484,6 +496,120 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ==================== MANUAL TEST FUNCTIONS ====================
+
+// 🧪 Test scheduler sekarang juga (untuk debugging)
+async function testSchedulerNow() {
+  try {
+    console.log('\n🧪 MANUAL TEST: Triggering test watering job NOW...');
+    
+    const now = new Date();
+    const testJobId = `manual-test-${now.getTime()}`;
+    
+    await wateringQueue.add(
+      'manual-test',
+      {
+        type: 'manual_test',
+        potNumbers: [1], // Test dengan 1 pot saja
+        pompaAir: true,
+        pompaPupuk: false,
+        duration: 10, // 10 detik test
+        scheduleId: testJobId,
+      },
+      {
+        jobId: testJobId,
+        removeOnComplete: true,
+        priority: 10, // Highest priority
+      }
+    );
+    
+    console.log(`✅ Test job added: ${testJobId}`);
+    console.log('   Watch for job processing logs...');
+  } catch (error) {
+    console.error('❌ Test scheduler failed:', error.message);
+  }
+}
+
+// 🔍 Check Firebase aktuator node structure
+async function checkAktuatorNode() {
+  try {
+    console.log('\n🔍 CHECKING AKTUATOR NODE...');
+    const snapshot = await db.ref('aktuator').once('value');
+    const aktuatorData = snapshot.val();
+    
+    if (!aktuatorData) {
+      console.log('❌ Aktuator node NOT FOUND in Firebase!');
+      console.log('   Creating default aktuator structure...');
+      
+      await db.ref('aktuator').set({
+        mosvet_1: false,  // Pompa Air
+        mosvet_2: false,  // Pompa Pupuk
+        mosvet_3: false,  // Pot 1
+        mosvet_4: false,  // Pot 2
+        mosvet_5: false,  // Pot 3
+        mosvet_6: false,  // Pot 4
+        mosvet_7: false,  // Pot 5
+        mosvet_8: false,  // Pengaduk
+      });
+      
+      console.log('✅ Aktuator node created with defaults');
+    } else {
+      console.log('✅ Aktuator node exists:');
+      for (const key in aktuatorData) {
+        console.log(`   ${key}: ${aktuatorData[key]}`);
+      }
+      
+      // Validate all required mosvets exist
+      const required = ['mosvet_1', 'mosvet_2', 'mosvet_3', 'mosvet_4', 'mosvet_5', 'mosvet_6', 'mosvet_7', 'mosvet_8'];
+      const missing = required.filter(key => !(key in aktuatorData));
+      
+      if (missing.length > 0) {
+        console.log(`⚠️  Missing mosvets: ${missing.join(', ')}`);
+        console.log('   Adding missing mosvets...');
+        
+        const updates = {};
+        missing.forEach(key => updates[key] = false);
+        await db.ref('aktuator').update(updates);
+        
+        console.log('✅ Missing mosvets added');
+      }
+    }
+  } catch (error) {
+    console.error('❌ Aktuator check failed:', error.message);
+  }
+}
+
+// 🕐 Show current time in multiple formats
+async function showCurrentTime() {
+  try {
+    const now = new Date();
+    console.log('\n🕐 CURRENT TIME ANALYSIS:');
+    console.log(`   Server Local: ${now.toString()}`);
+    console.log(`   Asia/Jakarta: ${now.toLocaleString('id-ID', {timeZone: 'Asia/Jakarta'})}`);
+    console.log(`   ISO: ${now.toISOString()}`);
+    console.log(`   Unix: ${now.getTime()}`);
+    console.log(`   TZ Env: ${process.env.TZ}`);
+    console.log(`   HH:MM Format: ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`);
+    
+    // Check Firebase kontrol waktu
+    const snapshot = await db.ref('kontrol').once('value');
+    const kontrolConfig = snapshot.val();
+    
+    if (kontrolConfig) {
+      console.log('\n📋 FIREBASE KONTROL:');
+      console.log(`   Mode Waktu: ${kontrolConfig.waktu ? 'ENABLED ✅' : 'DISABLED ❌'}`);
+      console.log(`   Waktu 1: ${kontrolConfig.waktu_1 || 'not set'}`);
+      console.log(`   Waktu 2: ${kontrolConfig.waktu_2 || 'not set'}`);
+      console.log(`   Durasi 1: ${kontrolConfig.durasi_1 || 'not set'}s`);
+      console.log(`   Durasi 2: ${kontrolConfig.durasi_2 || 'not set'}s`);
+    } else {
+      console.log('\n❌ Firebase kontrol node is empty!');
+    }
+  } catch (error) {
+    console.error('❌ Time check failed:', error.message);
+  }
+}
+
 // ==================== HEALTH CHECK ====================
 
 async function healthCheck() {
@@ -597,4 +723,23 @@ setTimeout(async () => {
     console.error('❌ Firebase verification failed:', error.message);
   }
 }, 3000);
+
+// Run diagnostic checks on startup
+setTimeout(async () => {
+  console.log('\n🔧 RUNNING DIAGNOSTIC CHECKS...');
+  await showCurrentTime();
+  await checkAktuatorNode();
+  console.log('\n✅ Diagnostic checks completed');
+  console.log('\n💡 TIP: To test scheduler manually, check the logs above for current time');
+  console.log('   Then set waktu_1 or waktu_2 in Firebase to match current time + 1 minute');
+}, 5000);
+
+// Auto-run test scheduler setiap 10 menit untuk memastikan worker alive
+setInterval(() => {
+  const now = new Date();
+  // Run at :00, :10, :20, :30, :40, :50
+  if (now.getMinutes() % 10 === 0 && now.getSeconds() < 30) {
+    showCurrentTime();
+  }
+}, 30000);
 
