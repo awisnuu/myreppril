@@ -243,10 +243,13 @@ let checkCounter = 0;
 
 async function checkScheduledWatering() {
   checkCounter++;
+  console.log(`\n🔎 [DEBUG] checkScheduledWatering() called - Counter: ${checkCounter}`);
   
   try {
+    console.log('   [DEBUG] Fetching Firebase /kontrol...');
     const snapshot = await db.ref('kontrol').once('value');
     const kontrolConfig = snapshot.val();
+    console.log(`   [DEBUG] Kontrol config received:`, kontrolConfig ? 'EXISTS' : 'NULL');
 
     const now = new Date();
     const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
@@ -269,6 +272,7 @@ async function checkScheduledWatering() {
 
     if (!kontrolConfig || !kontrolConfig.waktu) {
       // Waktu mode disabled
+      console.log(`   [DEBUG] Exiting early - kontrolConfig: ${kontrolConfig ? 'exists' : 'null'}, waktu: ${kontrolConfig?.waktu}`);
       return;
     }
 
@@ -377,11 +381,13 @@ console.log(`✅ Waktu Mode scheduler started (check every ${config.worker.check
 setTimeout(async () => {
   try {
     console.log('\n🚀 Running first schedule check immediately...');
+    console.log('[DEBUG] About to call checkScheduledWatering()...');
     await checkScheduledWatering();
+    console.log('[DEBUG] checkScheduledWatering() returned');
     console.log('✅ First check completed successfully');
   } catch (error) {
     console.error('❌ First check failed:', error.message);
-    console.error(error.stack);
+    console.error('[DEBUG] Error stack:', error.stack);
   }
 }, 8000);
 
