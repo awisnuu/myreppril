@@ -530,6 +530,24 @@ async function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
+// ==================== PREVENT CRASHES ====================
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error.message);
+  console.error(error.stack);
+  // Don't exit - try to keep worker running
+  console.log('⚠️  Worker continuing despite error...');
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise);
+  console.error('Reason:', reason);
+  // Don't exit - try to keep worker running
+  console.log('⚠️  Worker continuing despite rejection...');
+});
+
 // ==================== STARTUP COMPLETE ====================
 
 console.log('\n✨ ApsGo Railway Worker is running!');
@@ -543,3 +561,33 @@ console.log('\n🎯 Worker is ready to process jobs...\n');
 
 // Initial health check
 setTimeout(healthCheck, 5000);
+
+// ==================== KEEP-ALIVE MECHANISM ====================
+
+// Heartbeat every 30 seconds to prevent Railway from stopping container
+setInterval(() => {
+  const uptime = Math.floor(process.uptime());
+  const hours = Math.floor(uptime / 3600);
+  const minutes = Math.floor((uptime % 3600) / 60);
+  console.log(`💓 Heartbeat: Worker alive for ${hours}h ${minutes}m`);
+}, 30000);
+
+// Verify Firebase connection on startup
+setTimeout(async () => {
+  try {
+    console.log('🔍 Verifying Firebase connection...');
+    const snapshot = await db.ref('kontrol').once('value');
+    const data = snapshot.val();
+    if (data) {
+      console.log('✅ Firebase /kontrol readable - waktu mode:', data.waktu ? 'ENABLED' : 'DISABLED');
+      if (data.waktu) {
+        console.log(`   📅 Schedules: ${data.waktu_1 || 'none'} / ${data.waktu_2 || 'none'}`);
+      }
+    } else {
+      console.log('⚠️  Firebase /kontrol is empty - waiting for Flutter app to set schedule');
+    }
+  } catch (error) {
+    console.error('❌ Firebase verification failed:', error.message);
+  }
+}, 3000);
+
