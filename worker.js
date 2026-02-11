@@ -62,7 +62,8 @@ const config = {
 
 console.log('🚀 Starting ApsGo Railway Worker...');
 console.log(`📡 Firebase Project: ${config.firebase.projectId}`);
-console.log(`📦 Redis: ${config.redis.host}:${config.redis.port}`);
+console.log(`� Firebase DB URL: ${config.firebase.databaseURL}`);
+console.log(`�📦 Redis: ${config.redis.host}:${config.redis.port}`);
 console.log(`⏰ Timezone: ${process.env.TZ} (Current: ${new Date().toLocaleString('id-ID', {timeZone: 'Asia/Jakarta'})})`);
 
 // ==================== ENVIRONMENT VALIDATION ====================
@@ -240,6 +241,7 @@ let lastScheduleCheck = {};
 
 // Counter untuk tracking berapa kali check dilakukan
 let checkCounter = 0;
+let consecutiveFirebaseErrors = 0;
 
 // Helper function untuk Firebase fetch dengan timeout
 async function fetchWithTimeout(ref, timeoutMs = 10000) {
@@ -251,6 +253,47 @@ async function fetchWithTimeout(ref, timeoutMs = 10000) {
   ]);
 }
 
+// Fallback: Fetch via Firebase REST API (lebih reliable)
+async function fetchKontrolViaREST() {
+  const url = `${config.firebase.databaseURL}/kontrol.json`;
+  console.log(`   [DEBUG] Trying REST API: ${url}`);
+  
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 10000
+  });
+  
+  if (!response.ok) {
+    throw new Error(`REST API failed: ${response.status} ${response.statusText}`);
+  }
+  
+  const data = await response.json();
+  console.log('   [DEBUG] REST API successful!');
+  return data;
+}
+
+// Smart fetch: Try SDK first, fallback to REST if needed
+async function fetchKontrolSmart() {
+  try {
+    console.log('   [DEBUG] Attempting SDK fetch...');
+    const snapshot = await fetchWithTimeout(db.ref('kontrol'), 10000);
+    consecutiveFirebaseErrors = 0; // Reset error counter
+    return snapshot.val();
+  } catch (sdkError) {
+    console.warn('   ⚠️  SDK fetch failed, trying REST API...');
+    consecutiveFirebaseErrors++;
+    
+    try {
+      const data = await fetchKontrolViaREST();
+      return data;
+    } catch (restError) {
+      console.error('   ❌ REST API also failed:', restError.message);
+      throw new Error('Both SDK and REST API failed');
+    }
+  }
+}
+
 async function checkScheduledWatering() {
   checkCounter++;
   console.log(`\n🔎 [DEBUG] checkScheduledWatering() called - Counter: ${checkCounter}`);
@@ -258,11 +301,9 @@ async function checkScheduledWatering() {
   try {
     console.log('   [DEBUG] Fetching Firebase /kontrol...');
     
-    // Fetch dengan timeout 10 detik
-    const snapshot = await fetchWithTimeout(db.ref('kontrol'), 10000);
-    console.log('   [DEBUG] Firebase fetch completed!');
+    // Use smart fetch (SDK with REST fallback)
+    const kontrolConfig = await fetchKontrolSmart();
     
-    const kontrolConfig = snapshot.val();
     console.log(`   [DEBUG] Kontrol config received:`, kontrolConfig ? 'EXISTS' : 'NULL');
     
     if (kontrolConfig) {
