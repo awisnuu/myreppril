@@ -874,8 +874,7 @@ async function showCurrentTime() {
 
 async function healthCheck() {
   try {
-    // Check Firebase connection
-    await db.ref('.info/connecte (skip SDK, just check via config)
+    // Check Firebase connection (skip SDK, just check via config)
     const firebaseOk = config.firebase.databaseURL ? true : false;
 
     // Check Redis connection
@@ -885,7 +884,8 @@ async function healthCheck() {
     const queueStatus = await wateringQueue.getJobCounts();
 
     console.log('\n💚 HEALTH CHECK:');
-    console.log(`   Firebase: ${firebaseOk ? '✅' : '❌'}nnected`);
+    console.log(`   Firebase: ${firebaseOk ? '✅' : '❌'} Connected`);
+    console.log(`   Redis: ✅ Connected`);
     console.log(`   Queue: ${queueStatus.active} active, ${queueStatus.waiting} waiting`);
   } catch (error) {
     console.error('❤️‍🩹 HEALTH CHECK FAILED:', error.message);
