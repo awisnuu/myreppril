@@ -336,7 +336,7 @@ async function checkScheduledWatering() {
     }
 
     if (kontrolConfig.waktu_1 && kontrolConfig.waktu_1 === currentTime) {
-      const scheduleKey = `jadwal_1_${dateKey}_${currentTime}`;
+      const scheduleKey = `jadwal_1_${dateKey}_${currentTime.replace(':', '_')}`;
 
       if (!lastScheduleCheck[scheduleKey]) {
         console.log(`\n🕐 JADWAL 1 TRIGGERED: ${currentTime}`);
@@ -375,7 +375,7 @@ async function checkScheduledWatering() {
 
     // Check Jadwal 2
     if (kontrolConfig.waktu_2 && kontrolConfig.waktu_2 === currentTime) {
-      const scheduleKey = `jadwal_2_${dateKey}_${currentTime}`;
+      const scheduleKey = `jadwal_2_${dateKey}_${currentTime.replace(':', '_')}`;
 
       if (!lastScheduleCheck[scheduleKey]) {
         console.log(`\n🕑 JADWAL 2 TRIGGERED: ${currentTime}`);
