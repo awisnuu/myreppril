@@ -153,7 +153,16 @@ const wateringWorker = new Worker(
 
       // Turn ON
       console.log('   🔛 Turning ON:', Object.keys(updates).join(', '));
-      await db.ref('aktuator').update(updates);
+      console.log('   📌 Firebase path: aktuator');
+      console.log('   📝 Updates:', JSON.stringify(updates, null, 2));
+      
+      const updateResult = await db.ref('aktuator').update(updates);
+      console.log('   ✅ Firebase update successful');
+      
+      // Verify update
+      const verifySnapshot = await db.ref('aktuator').once('value');
+      const aktuatorState = verifySnapshot.val();
+      console.log('   🔍 Verified aktuator state:', JSON.stringify(aktuatorState, null, 2));
 
       // Wait for duration with progress logging
       const startTime = Date.now();
@@ -172,8 +181,9 @@ const wateringWorker = new Worker(
       for (const key in updates) {
         offUpdates[key] = false;
       }
-      console.log('   🔴 Turning OFF');
+      console.log('   🔴 Turning OFF:', Object.keys(offUpdates).join(', '));
       await db.ref('aktuator').update(offUpdates);
+      console.log('   ✅ Aktuators turned OFF successfully');
 
       // Log history
       await logHistory(type, potNumbers, duration);
@@ -228,23 +238,32 @@ wateringWorker.on('failed', (job, err) => {
 
 let lastScheduleCheck = {};
 
+// Counter untuk tracking berapa kali check dilakukan
+let checkCounter = 0;
+
 async function checkScheduledWatering() {
+  checkCounter++;
+  
   try {
     const snapshot = await db.ref('kontrol').once('value');
     const kontrolConfig = snapshot.val();
 
-    // 🔍 DEBUGGING: Selalu log waktu server vs Firebase untuk monitor sync
     const now = new Date();
     const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+    const currentSeconds = now.getSeconds();
     const dateKey = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`;
     
-    // Log setiap 5 menit untuk monitoring (menit habis dibagi 5)
-    if (now.getMinutes() % 5 === 0 && now.getSeconds() < 60) {
-      console.log(`\n⏰ TIME CHECK: ${dateKey} ${currentTime} (${now.toLocaleString('id-ID', {timeZone: 'Asia/Jakarta'})})`);
+    // 🔍 VERBOSE LOG: Log setiap check untuk memastikan fungsi berjalan
+    console.log(`\n⏱️  CHECK #${checkCounter}: ${currentTime}:${currentSeconds.toString().padStart(2, '0')} | Mode: ${kontrolConfig?.waktu ? '✅' : '❌'}`);
+    
+    // Log detail setiap 3 menit ATAU jika menit habis dibagi 5
+    if (checkCounter % 3 === 0 || now.getMinutes() % 5 === 0) {
+      console.log(`   📅 Date: ${dateKey}`);
+      console.log(`   🕐 Current: ${currentTime} (${now.toLocaleString('id-ID', {timeZone: 'Asia/Jakarta'})})`);
       console.log(`   Mode Waktu: ${kontrolConfig?.waktu ? '✅ ENABLED' : '❌ DISABLED'}`);
       if (kontrolConfig?.waktu) {
-        console.log(`   Jadwal 1: ${kontrolConfig.waktu_1 || 'not set'} (${kontrolConfig.waktu_1 === currentTime ? '🔔 MATCH!' : 'no match'})`);
-        console.log(`   Jadwal 2: ${kontrolConfig.waktu_2 || 'not set'} (${kontrolConfig.waktu_2 === currentTime ? '🔔 MATCH!' : 'no match'})`);
+        console.log(`   Jadwal 1: ${kontrolConfig.waktu_1 || 'not set'} ${kontrolConfig.waktu_1 === currentTime ? '🔔 MATCH!' : ''}`);
+        console.log(`   Jadwal 2: ${kontrolConfig.waktu_2 || 'not set'} ${kontrolConfig.waktu_2 === currentTime ? '🔔 MATCH!' : ''}`);
       }
     }
 
@@ -258,25 +277,36 @@ async function checkScheduledWatering() {
 
       if (!lastScheduleCheck[scheduleKey]) {
         console.log(`\n🕐 JADWAL 1 TRIGGERED: ${currentTime}`);
+        console.log(`   🎯 Attempting to add job to queue...`);
 
-        await wateringQueue.add(
-          'schedule-1',
-          {
-            type: 'waktu_jadwal_1',
-            potNumbers: [1, 2, 3, 4, 5], // All pots
-            pompaAir: true,
-            pompaPupuk: true,
-            duration: kontrolConfig.durasi_1 || 60,
-            scheduleId: scheduleKey,
-          },
-          {
-            jobId: scheduleKey,
-            removeOnComplete: true,
-          }
-        );
-
-        lastScheduleCheck[scheduleKey] = true;
-        console.log(`   📌 Added to queue: ${scheduleKey}`);
+        try {
+          await wateringQueue.add(
+            'schedule-1',
+            {
+              type: 'waktu_jadwal_1',
+              potNumbers: [1, 2, 3, 4, 5], // All pots
+              pompaAir: true,
+              pompaPupuk: true,
+              duration: kontrolConfig.durasi_1 || 60,
+              scheduleId: scheduleKey,
+            },
+            {
+              jobId: scheduleKey,
+              removeOnComplete: true,
+            }
+          );
+          
+          lastScheduleCheck[scheduleKey] = true;
+          console.log(`   ✅ Successfully added to queue: ${scheduleKey}`);
+          
+          // Check queue status
+          const queueStatus = await wateringQueue.getJobCounts();
+          console.log(`   📊 Queue status: ${queueStatus.active} active, ${queueStatus.waiting} waiting`);
+        } catch (queueError) {
+          console.error(`   ❌ Failed to add to queue:`, queueError.message);
+        }
+      } else {
+        console.log(`   ⏭️  Jadwal 1 already triggered: ${scheduleKey}`);
       }
     }
 
@@ -286,25 +316,36 @@ async function checkScheduledWatering() {
 
       if (!lastScheduleCheck[scheduleKey]) {
         console.log(`\n🕑 JADWAL 2 TRIGGERED: ${currentTime}`);
+        console.log(`   🎯 Attempting to add job to queue...`);
 
-        await wateringQueue.add(
-          'schedule-2',
-          {
-            type: 'waktu_jadwal_2',
-            potNumbers: [1, 2, 3, 4, 5], // All pots
-            pompaAir: true,
-            pompaPupuk: true,
-            duration: kontrolConfig.durasi_2 || 60,
-            scheduleId: scheduleKey,
-          },
-          {
-            jobId: scheduleKey,
-            removeOnComplete: true,
-          }
-        );
+        try {
+          await wateringQueue.add(
+            'schedule-2',
+            {
+              type: 'waktu_jadwal_2',
+              potNumbers: [1, 2, 3, 4, 5], // All pots
+              pompaAir: true,
+              pompaPupuk: true,
+              duration: kontrolConfig.durasi_2 || 60,
+              scheduleId: scheduleKey,
+            },
+            {
+              jobId: scheduleKey,
+              removeOnComplete: true,
+            }
+          );
 
-        lastScheduleCheck[scheduleKey] = true;
-        console.log(`   📌 Added to queue: ${scheduleKey}`);
+          lastScheduleCheck[scheduleKey] = true;
+          console.log(`   ✅ Successfully added to queue: ${scheduleKey}`);
+          
+          // Check queue status
+          const queueStatus = await wateringQueue.getJobCounts();
+          console.log(`   📊 Queue status: ${queueStatus.active} active, ${queueStatus.waiting} waiting`);
+        } catch (queueError) {
+          console.error(`   ❌ Failed to add to queue:`, queueError.message);
+        }
+      } else {
+        console.log(`   ⏭️  Jadwal 2 already triggered: ${scheduleKey}`);
       }
     }
 
@@ -323,18 +364,36 @@ async function checkScheduledWatering() {
 setInterval(checkScheduledWatering, config.worker.checkInterval);
 console.log(`✅ Waktu Mode scheduler started (check every ${config.worker.checkInterval / 1000}s)`);
 
+// Jalankan check pertama kali setelah 5 detik (jangan tunggu 60 detik)
+setTimeout(() => {
+  console.log('🚀 Running first schedule check immediately...');
+  checkScheduledWatering();
+}, 5000);
+
 // ==================== SENSOR MODE (THRESHOLD MONITORING) ====================
+
+let sensorCheckCounter = 0;
 
 async function setupSensorMonitoring() {
   console.log('✅ Sensor Mode monitoring started');
 
   db.ref('data').on('value', async (snapshot) => {
+    sensorCheckCounter++;
+    
     try {
       const sensorData = snapshot.val();
-      if (!sensorData) return;
+      if (!sensorData) {
+        console.log('⚠️  Sensor data is null/empty');
+        return;
+      }
 
       const configSnapshot = await db.ref('kontrol').once('value');
       const kontrolConfig = configSnapshot.val();
+
+      // Log sensor check (verbose hanya setiap 10 kali)
+      if (sensorCheckCounter % 10 === 0) {
+        console.log(`\n🌡️  SENSOR CHECK #${sensorCheckCounter} | Mode Otomatis: ${kontrolConfig?.otomatis ? '✅' : '❌'}`);
+      }
 
       if (!kontrolConfig || !kontrolConfig.otomatis) {
         // Sensor mode disabled
