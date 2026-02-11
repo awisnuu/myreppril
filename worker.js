@@ -180,9 +180,11 @@ const wateringWorker = new Worker(
       }
       console.log('   🔴 Turning OFF:', Object.keys(offUpdates).join(', '));
       await updateFirebaseSmart('aktuator', offUpdates);
+      console.log('   ✅ Turn OFF completed, now logging history...');
 
       // Log history
       await logHistory(type, potNumbers, duration);
+      console.log('   ✅ History logged successfully');
 
       // Update last watering time
       for (const pot of potNumbers) {
@@ -217,6 +219,7 @@ const wateringWorker = new Worker(
   {
     connection: redis,
     concurrency: config.worker.concurrency,
+    lockDuration: 900000, // 15 minutes max job time (duration 600s + 5min buffer)
     removeOnComplete: { count: 100 }, // Keep last 100 completed jobs
     removeOnFail: { count: 50 }, // Keep last 50 failed jobs
   }
@@ -248,16 +251,36 @@ async function fetchWithTimeout(ref, timeoutMs = 10000) {
   ]);
 }
 
+// Helper: Fetch with timeout wrapper (for REST API calls)
+async function fetchWithTimeout2(url, options = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    return response;
+  } catch (error) {
+    clearTimeout(timeout);
+    if (error.name === 'AbortError') {
+      throw new Error('REST API timeout');
+    }
+    throw error;
+  }
+}
+
 // Fallback: Fetch via Firebase REST API (lebih reliable)
 async function fetchKontrolViaREST() {
   const url = `${config.firebase.databaseURL}/kontrol.json`;
   console.log(`   [DEBUG] Trying REST API: ${url}`);
   
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout2(url, {
     method: 'GET',
-    headers: { 'Content-Type': 'application/json' },
-    timeout: 10000
-  });
+    headers: { 'Content-Type': 'application/json' }
+  }, 10000);
   
   if (!response.ok) {
     throw new Error(`REST API failed: ${response.status} ${response.statusText}`);
@@ -294,12 +317,11 @@ async function updateFirebaseViaREST(path, updates) {
   const url = `${config.firebase.databaseURL}/${path}.json`;
   console.log(`   [DEBUG] REST API PATCH: ${url}`);
   
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout2(url, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(updates),
-    timeout: 10000
-  });
+    body: JSON.stringify(updates)
+  }, 10000);
   
   if (!response.ok) {
     throw new Error(`REST PATCH failed: ${response.status}`);
@@ -322,20 +344,24 @@ async function updateWithTimeout(ref, updates, timeoutMs = 10000) {
 
 // Smart update: Try SDK first, fallback to REST if timeout
 async function updateFirebaseSmart(path, updates) {
+  const updateStr = JSON.stringify(updates);
+  console.log(`   [UPDATE START] Path: ${path}, Data: ${updateStr}`);
+  
   try {
-    console.log(`   [DEBUG] Attempting SDK update to ${path}...`);
+    console.log(`   [UPDATE] Step 1: Attempting SDK update...`);
     await updateWithTimeout(db.ref(path), updates, 10000);
-    console.log('   ✅ Firebase SDK update successful');
+    console.log(`   ✅ [UPDATE] Step 2: SDK update successful!`);
     return true;
   } catch (sdkError) {
-    console.warn(`   ⚠️  SDK update failed, trying REST API...`);
+    console.warn(`   ⚠️  [UPDATE] Step 2: SDK failed (${sdkError.message}), trying REST API...`);
     
     try {
+      console.log(`   [UPDATE] Step 3: Attempting REST API...`);
       await updateFirebaseViaREST(path, updates);
-      console.log('   ✅ Firebase REST update successful');
+      console.log(`   ✅ [UPDATE] Step 4: REST API successful!`);
       return true;
     } catch (restError) {
-      console.error('   ❌ REST update also failed:', restError.message);
+      console.error(`   ❌ [UPDATE] Step 4: REST failed (${restError.message}) - BOTH METHODS FAILED!`);
       throw new Error('Both SDK and REST update failed');
     }
   }
@@ -346,12 +372,11 @@ async function setFirebaseViaREST(path, data) {
   const url = `${config.firebase.databaseURL}/${path}.json`;
   
   const response = await fetch(url, {
+    method: 'PUT',WithTimeout2(url, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-    timeout: 10000
-  });
-  
+    body: JSON.stringify(data)
+  }, 10000
   if (!response.ok) {
     throw new Error(`REST PUT failed: ${response.status}`);
   }
@@ -371,14 +396,23 @@ async function setWithTimeout(ref, data, timeoutMs = 10000) {
 
 // Smart set: Try SDK first, fallback to REST if timeout
 async function setFirebaseSmart(path, data) {
+  const dataStr = JSON.stringify(data);
+  console.log(`   [SET START] Path: ${path}, Data: ${dataStr.substring(0,100)}...`);
+  
   try {
+    console.log(`   [SET] Step 1: Attempting SDK set...`);
     await setWithTimeout(db.ref(path), data, 10000);
+    console.log(`   ✅ [SET] Step 2: SDK set successful!`);
     return true;
   } catch (sdkError) {
+    console.warn(`   ⚠️  [SET] Step 2: SDK failed (${sdkError.message}), trying REST API...`);
     try {
+      console.log(`   [SET] Step 3: Attempting REST API...`);
       await setFirebaseViaREST(path, data);
+      console.log(`   ✅ [SET] Step 4: REST API successful!`);
       return true;
     } catch (restError) {
+      console.error(`   ❌ [SET] Step 4: REST failed - BOTH METHODS FAILED!`);
       throw new Error('Both SDK and REST set failed');
     }
   }
@@ -392,11 +426,10 @@ async function readFirebaseSmart(path) {
   } catch (sdkError) {
     const url = `${config.firebase.databaseURL}/${path}.json`;
     const response = await fetch(url, {
+      method: 'GET',WithTimeout2(url, {
       method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
-    });
-    
+      headers: { 'Content-Type': 'application/json' }
+    }, 10000
     if (!response.ok) {
       throw new Error(`REST GET failed: ${response.status}`);
     }
@@ -729,9 +762,9 @@ const cleanupJob = new cron.CronJob('0 2 * * *', async () => {
           const date = new Date(year, month - 1, day);
 
           if (date < cutoffDate) {
-            // Use REST API DELETE
+            // Use REST API DELETE with timeout wrapper
             const url = `${config.firebase.databaseURL}/history/${dateKey}.json`;
-            await fetch(url, { method: 'DELETE', timeout: 10000 });
+            await fetchWithTimeout2(url, { method: 'DELETE' }, 10000);
             deletedCount++;
             console.log(`   🗑️ Deleted: ${dateKey}`);
           }
