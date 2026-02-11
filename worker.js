@@ -34,7 +34,7 @@ const config = {
   },
   worker: {
     concurrency: 1, // Process 1 job at a time (prevent race condition)
-    checkInterval: 30000, // Check jadwal setiap 30 detik
+    checkInterval: 60000, // Check jadwal setiap 60 detik (reduced from 30s)
     sensorDebounce: 120000, // 2 menit minimum antar penyiraman per pot
   },
 };
@@ -70,6 +70,12 @@ console.log('✅ All required environment variables are set');
 
 // ==================== FIREBASE INITIALIZATION ====================
 
+// Suppress Firebase warnings in production
+if (process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT) {
+  process.env.FIREBASE_AUTH_EMULATOR_HOST = undefined;
+  process.env.FIRESTORE_EMULATOR_HOST = undefined;
+}
+
 try {
   admin.initializeApp({
     credential: admin.credential.cert({
@@ -86,6 +92,21 @@ try {
 }
 
 const db = admin.database();
+
+// Add error handlers for Firebase database
+db.ref('.info/connected').on('value', (snap) => {
+  if (snap.val() === true) {
+    console.log('🔌 Firebase realtime connection active');
+  }
+});
+
+// Suppress Firebase internal warnings by catching errors
+process.on('warning', (warning) => {
+  // Suppress specific Firebase warnings but log others
+  if (!warning.message?.includes('firebase/database')) {
+    console.warn('⚠️ Warning:', warning.message);
+  }
+});
 
 // ==================== REDIS & QUEUE SETUP ====================
 
@@ -202,25 +223,17 @@ let lastScheduleCheck = {};
 
 async function checkScheduledWatering() {
   try {
-    console.log(`\n⏰ [DEBUG] Checking scheduled watering... ${new Date().toISOString()}`);
-    
     const snapshot = await db.ref('kontrol').once('value');
     const kontrolConfig = snapshot.val();
-    
-    console.log('📊 [DEBUG] Retrieved kontrol config:', JSON.stringify(kontrolConfig, null, 2));
 
     if (!kontrolConfig || !kontrolConfig.waktu) {
-      // Waktu mode disabled
-      console.log('⏹️ [DEBUG] Waktu mode is disabled or no config found');
+      // Waktu mode disabled - no log to reduce noise
       return;
     }
 
     const now = new Date();
     const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
     const dateKey = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`;
-    
-    console.log(`🕐 [DEBUG] Current time: ${currentTime}, Date: ${dateKey}`);
-    console.log(`📅 [DEBUG] Scheduled times - Jadwal 1: ${kontrolConfig.waktu_1}, Jadwal 2: ${kontrolConfig.waktu_2}`);
     if (kontrolConfig.waktu_1 && kontrolConfig.waktu_1 === currentTime) {
       const scheduleKey = `jadwal_1_${dateKey}_${currentTime}`;
 
@@ -245,11 +258,7 @@ async function checkScheduledWatering() {
 
         lastScheduleCheck[scheduleKey] = true;
         console.log(`   📌 Added to queue: ${scheduleKey}`);
-      } else {
-        console.log(`⚠️ [DEBUG] Jadwal 1 already processed: ${scheduleKey}`);
       }
-    } else if (kontrolConfig.waktu_1) {
-      console.log(`⏰ [DEBUG] Jadwal 1 time mismatch - Expected: ${kontrolConfig.waktu_1}, Current: ${currentTime}`);
     }
 
     // Check Jadwal 2
@@ -291,7 +300,7 @@ async function checkScheduledWatering() {
   }
 }
 
-// Run check setiap 30 detik
+// Run check setiap 60 detik
 setInterval(checkScheduledWatering, config.worker.checkInterval);
 console.log(`✅ Waktu Mode scheduler started (check every ${config.worker.checkInterval / 1000}s)`);
 
