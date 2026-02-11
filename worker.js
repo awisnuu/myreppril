@@ -241,15 +241,33 @@ let lastScheduleCheck = {};
 // Counter untuk tracking berapa kali check dilakukan
 let checkCounter = 0;
 
+// Helper function untuk Firebase fetch dengan timeout
+async function fetchWithTimeout(ref, timeoutMs = 10000) {
+  return Promise.race([
+    ref.once('value'),
+    new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Firebase fetch timeout')), timeoutMs)
+    )
+  ]);
+}
+
 async function checkScheduledWatering() {
   checkCounter++;
   console.log(`\n🔎 [DEBUG] checkScheduledWatering() called - Counter: ${checkCounter}`);
   
   try {
     console.log('   [DEBUG] Fetching Firebase /kontrol...');
-    const snapshot = await db.ref('kontrol').once('value');
+    
+    // Fetch dengan timeout 10 detik
+    const snapshot = await fetchWithTimeout(db.ref('kontrol'), 10000);
+    console.log('   [DEBUG] Firebase fetch completed!');
+    
     const kontrolConfig = snapshot.val();
     console.log(`   [DEBUG] Kontrol config received:`, kontrolConfig ? 'EXISTS' : 'NULL');
+    
+    if (kontrolConfig) {
+      console.log(`   [DEBUG] Kontrol data:`, JSON.stringify(kontrolConfig, null, 2));
+    }
 
     const now = new Date();
     const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
@@ -361,7 +379,17 @@ async function checkScheduledWatering() {
     }
   } catch (error) {
     console.error('❌ Error checking scheduled watering:', error.message);
-    console.error('Stack trace:', error.stack);
+    console.error('[DEBUG] Error type:', error.constructor.name);
+    console.error('[DEBUG] Stack trace:', error.stack);
+    
+    if (error.message === 'Firebase fetch timeout') {
+      console.error('⚠️  Firebase is not responding! Network or connection issue.');
+      console.error('   This could be:');
+      console.error('   - Slow network connection');
+      console.error('   - Firebase Realtime DB throttling');
+      console.error('   - Security rules blocking access');
+    }
+    
     // Continue running - don't crash worker
   }
 }
@@ -408,7 +436,7 @@ async function setupSensorMonitoring() {
         return;
       }
 
-      const configSnapshot = await db.ref('kontrol').once('value');
+      const configSnapshot = await fetchWithTimeout(db.ref('kontrol'), 10000);
       const kontrolConfig = configSnapshot.val();
 
       // Log sensor check (verbose hanya setiap 10 kali)
@@ -672,8 +700,10 @@ async function showCurrentTime() {
     console.log(`   HH:MM Format: ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`);
     
     // Check Firebase kontrol waktu
-    const snapshot = await db.ref('kontrol').once('value');
+    console.log('[DEBUG] Fetching kontrol for time analysis...');
+    const snapshot = await fetchWithTimeout(db.ref('kontrol'), 10000);
     const kontrolConfig = snapshot.val();
+    console.log('[DEBUG] Kontrol fetch successful');
     
     if (kontrolConfig) {
       console.log('\n📋 FIREBASE KONTROL:');
@@ -789,7 +819,9 @@ setInterval(() => {
 setTimeout(async () => {
   try {
     console.log('🔍 Verifying Firebase connection...');
-    const snapshot = await db.ref('kontrol').once('value');
+    console.log('[DEBUG] Testing Firebase read with timeout...');
+    const snapshot = await fetchWithTimeout(db.ref('kontrol'), 10000);
+    console.log('[DEBUG] Firebase read successful!');
     const data = snapshot.val();
     if (data) {
       console.log('✅ Firebase /kontrol readable - waktu mode:', data.waktu ? 'ENABLED' : 'DISABLED');
