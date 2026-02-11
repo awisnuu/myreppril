@@ -8,6 +8,27 @@
  * - Firebase Realtime DB: Sync dengan Flutter app dan ESP32
  */
 
+// ==================== SUPPRESS FIREBASE WARNINGS ====================
+
+// Completely suppress Firebase SDK warnings
+process.env.FIREBASE_DATABASE_EMULATOR_HOST = undefined;
+process.env.FIRESTORE_EMULATOR_HOST = undefined;
+
+// Override console.warn to filter Firebase warnings
+const originalWarn = console.warn;
+console.warn = function(...args) {
+  const message = args.join(' ');
+  // Suppress specific Firebase warnings
+  if (message.includes('FIREBASE WARNING') || 
+      message.includes('@firebase/database') ||
+      message.includes('firebase/database')) {
+    return; // Silent - don't log
+  }
+  originalWarn.apply(console, args);
+};
+
+// ==================== IMPORTS ====================
+
 require('dotenv').config();
 const admin = require('firebase-admin');
 const { Queue, Worker } = require('bullmq');
@@ -70,12 +91,6 @@ console.log('✅ All required environment variables are set');
 
 // ==================== FIREBASE INITIALIZATION ====================
 
-// Suppress Firebase warnings in production
-if (process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT) {
-  process.env.FIREBASE_AUTH_EMULATOR_HOST = undefined;
-  process.env.FIRESTORE_EMULATOR_HOST = undefined;
-}
-
 try {
   admin.initializeApp({
     credential: admin.credential.cert({
@@ -97,14 +112,6 @@ const db = admin.database();
 db.ref('.info/connected').on('value', (snap) => {
   if (snap.val() === true) {
     console.log('🔌 Firebase realtime connection active');
-  }
-});
-
-// Suppress Firebase internal warnings by catching errors
-process.on('warning', (warning) => {
-  // Suppress specific Firebase warnings but log others
-  if (!warning.message?.includes('firebase/database')) {
-    console.warn('⚠️ Warning:', warning.message);
   }
 });
 
