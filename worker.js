@@ -240,9 +240,15 @@ let lastScheduleCheck = {};
 // Counter untuk tracking berapa kali check dilakukan
 let checkCounter = 0;
 let consecutiveFirebaseErrors = 0;
+let sdkSuccessCount = 0;
+let restFallbackCount = 0;
+
+// Smart fallback: Skip SDK jika sudah gagal berturut-turut 3x
+const SKIP_SDK_THRESHOLD = 3;
+const RESET_THRESHOLD_AFTER = 50; // Reset counter setelah 50 check (50 menit)
 
 // Helper function untuk Firebase fetch dengan timeout
-async function fetchWithTimeout(ref, timeoutMs = 10000) {
+async function fetchWithTimeout(ref, timeoutMs = 5000) {
   return Promise.race([
     ref.once('value'),
     new Promise((_, reject) => 
@@ -252,7 +258,7 @@ async function fetchWithTimeout(ref, timeoutMs = 10000) {
 }
 
 // Helper: Fetch with timeout wrapper (for REST API calls)
-async function fetchWithTimeout2(url, options = {}, timeoutMs = 10000) {
+async function fetchWithTimeout2(url, options = {}, timeoutMs = 8000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   
@@ -280,7 +286,7 @@ async function fetchKontrolViaREST() {
   const response = await fetchWithTimeout2(url, {
     method: 'GET',
     headers: { 'Content-Type': 'application/json' }
-  }, 10000);
+  }, 8000);
   
   if (!response.ok) {
     throw new Error(`REST API failed: ${response.status} ${response.statusText}`);
@@ -293,10 +299,36 @@ async function fetchKontrolViaREST() {
 
 // Smart fetch: Try SDK first, fallback to REST if needed
 async function fetchKontrolSmart() {
+  // Smart fallback: Skip SDK if it failed 3+ times consecutively
+  const shouldSkipSDK = consecutiveFirebaseErrors >= SKIP_SDK_THRESHOLD;
+  
+  if (shouldSkipSDK) {
+    console.log('   [SMART] Skipping SDK (3+ consecutive failures), using REST API directly...');
+    try {
+      const data = await fetchKontrolViaREST();
+      restFallbackCount++;
+      
+      // Reset counter setelah threshold untuk retry SDK
+      if (restFallbackCount >= RESET_THRESHOLD_AFTER) {
+        console.log('   [SMART] Resetting SDK retry counter...');
+        consecutiveFirebaseErrors = 0;
+        restFallbackCount = 0;
+      }
+      
+      return data;
+    } catch (restError) {
+      console.error('   ❌ REST API failed:', restError.message);
+      throw new Error('REST API failed');
+    }
+  }
+  
+  // Normal flow: Try SDK first
   try {
     console.log('   [DEBUG] Attempting SDK fetch...');
-    const snapshot = await fetchWithTimeout(db.ref('kontrol'), 10000);
+    const snapshot = await fetchWithTimeout(db.ref('kontrol'), 5000);
     consecutiveFirebaseErrors = 0; // Reset error counter
+    restFallbackCount = 0; // Reset fallback counter
+    sdkSuccessCount++;
     return snapshot.val();
   } catch (sdkError) {
     console.warn('   ⚠️  SDK fetch failed, trying REST API...');
@@ -304,6 +336,13 @@ async function fetchKontrolSmart() {
     
     try {
       const data = await fetchKontrolViaREST();
+      restFallbackCount++;
+      
+      // Log peringatan jika SDK terus gagal
+      if (consecutiveFirebaseErrors === SKIP_SDK_THRESHOLD) {
+        console.warn(`   🚨 SDK failed ${SKIP_SDK_THRESHOLD}x consecutively! Will use REST API directly for next ${RESET_THRESHOLD_AFTER} checks.`);
+      }
+      
       return data;
     } catch (restError) {
       console.error('   ❌ REST API also failed:', restError.message);
@@ -321,7 +360,7 @@ async function updateFirebaseViaREST(path, updates) {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates)
-  }, 10000);
+  }, 8000);
   
   if (!response.ok) {
     throw new Error(`REST PATCH failed: ${response.status}`);
@@ -333,7 +372,7 @@ async function updateFirebaseViaREST(path, updates) {
 }
 
 // Helper: Update with timeout wrapper
-async function updateWithTimeout(ref, updates, timeoutMs = 10000) {
+async function updateWithTimeout(ref, updates, timeoutMs = 5000) {
   return Promise.race([
     ref.update(updates),
     new Promise((_, reject) => 
@@ -347,9 +386,24 @@ async function updateFirebaseSmart(path, updates) {
   const updateStr = JSON.stringify(updates);
   console.log(`   [UPDATE START] Path: ${path}, Data: ${updateStr}`);
   
+  // If SDK is consistently failing, skip it for updates too
+  const shouldSkipSDK = consecutiveFirebaseErrors >= SKIP_SDK_THRESHOLD;
+  
+  if (shouldSkipSDK) {
+    console.log(`   [UPDATE] Using REST API directly (SDK disabled)`);
+    try {
+      await updateFirebaseViaREST(path, updates);
+      console.log(`   ✅ [UPDATE] REST API successful!`);
+      return true;
+    } catch (restError) {
+      console.error(`   ❌ [UPDATE] REST failed: ${restError.message}`);
+      throw new Error('REST update failed');
+    }
+  }
+  
   try {
     console.log(`   [UPDATE] Step 1: Attempting SDK update...`);
-    await updateWithTimeout(db.ref(path), updates, 10000);
+    await updateWithTimeout(db.ref(path), updates, 5000);
     console.log(`   ✅ [UPDATE] Step 2: SDK update successful!`);
     return true;
   } catch (sdkError) {
@@ -375,7 +429,7 @@ async function setFirebaseViaREST(path, data) {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
-  }, 10000);
+  }, 8000);
   
   if (!response.ok) {
     throw new Error(`REST PUT failed: ${response.status}`);
@@ -385,7 +439,7 @@ async function setFirebaseViaREST(path, data) {
 }
 
 // Helper: Set with timeout wrapper
-async function setWithTimeout(ref, data, timeoutMs = 10000) {
+async function setWithTimeout(ref, data, timeoutMs = 5000) {
   return Promise.race([
     ref.set(data),
     new Promise((_, reject) => 
@@ -399,9 +453,24 @@ async function setFirebaseSmart(path, data) {
   const dataStr = JSON.stringify(data);
   console.log(`   [SET START] Path: ${path}, Data: ${dataStr.substring(0,100)}...`);
   
+  // If SDK is consistently failing, skip it
+  const shouldSkipSDK = consecutiveFirebaseErrors >= SKIP_SDK_THRESHOLD;
+  
+  if (shouldSkipSDK) {
+    console.log(`   [SET] Using REST API directly (SDK disabled)`);
+    try {
+      await setFirebaseViaREST(path, data);
+      console.log(`   ✅ [SET] REST API successful!`);
+      return true;
+    } catch (restError) {
+      console.error(`   ❌ [SET] REST failed: ${restError.message}`);
+      throw new Error('REST set failed');
+    }
+  }
+  
   try {
     console.log(`   [SET] Step 1: Attempting SDK set...`);
-    await setWithTimeout(db.ref(path), data, 10000);
+    await setWithTimeout(db.ref(path), data, 5000);
     console.log(`   ✅ [SET] Step 2: SDK set successful!`);
     return true;
   } catch (sdkError) {
@@ -420,15 +489,32 @@ async function setFirebaseSmart(path, data) {
 
 // Smart read: Try SDK first, fallback to REST if timeout (for any path)
 async function readFirebaseSmart(path) {
+  const shouldSkipSDK = consecutiveFirebaseErrors >= SKIP_SDK_THRESHOLD;
+  
+  if (shouldSkipSDK) {
+    console.log('   [READ] Using REST API directly (SDK disabled)');
+    const url = `${config.firebase.databaseURL}/${path}.json`;
+    const response = await fetchWithTimeout2(url, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' }
+    }, 8000);
+    
+    if (!response.ok) {
+      throw new Error(`REST GET failed: ${response.status}`);
+    }
+    
+    return await response.json();
+  }
+  
   try {
-    const snapshot = await fetchWithTimeout(db.ref(path), 10000);
+    const snapshot = await fetchWithTimeout(db.ref(path), 5000);
     return snapshot.val();
   } catch (sdkError) {
     const url = `${config.firebase.databaseURL}/${path}.json`;
     const response = await fetchWithTimeout2(url, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' }
-    }, 10000);
+    }, 8000);
     
     if (!response.ok) {
       throw new Error(`REST GET failed: ${response.status}`);
@@ -467,6 +553,7 @@ async function checkScheduledWatering() {
       console.log(`   📅 Date: ${dateKey}`);
       console.log(`   🕐 Current: ${currentTime} (${now.toLocaleString('id-ID', {timeZone: 'Asia/Jakarta'})})`);
       console.log(`   Mode Waktu: ${kontrolConfig?.waktu ? '✅ ENABLED' : '❌ DISABLED'}`);
+      console.log(`   📊 API Stats: SDK=${sdkSuccessCount} | REST=${restFallbackCount} | Errors=${consecutiveFirebaseErrors}`);
       if (kontrolConfig?.waktu) {
         console.log(`   Jadwal 1: ${kontrolConfig.waktu_1 || 'not set'} ${kontrolConfig.waktu_1 === currentTime ? '🔔 MATCH!' : ''}`);
         console.log(`   Jadwal 2: ${kontrolConfig.waktu_2 || 'not set'} ${kontrolConfig.waktu_2 === currentTime ? '🔔 MATCH!' : ''}`);
