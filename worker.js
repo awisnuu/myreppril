@@ -786,131 +786,180 @@ setTimeout(async () => {
 
 let sensorCheckCounter = 0;
 
+// Core sensor check logic (shared by listener and polling)
+async function checkSensorThresholds() {
+  sensorCheckCounter++;
+  
+  try {
+    // Fetch sensor data using smart method (REST fallback)
+    const sensorData = await readFirebaseSmart('data');
+    
+    if (!sensorData) {
+      console.log('⚠️  Sensor data is null/empty - ESP32 might not be sending data');
+      return;
+    }
+
+    // Fetch kontrol config using smart method
+    const kontrolConfig = await fetchKontrolSmart();
+
+    if (!kontrolConfig) {
+      console.log('⚠️  Kontrol config is null');
+      return;
+    }
+    
+    // Check if sensor mode is enabled
+    if (!kontrolConfig.sensor) {
+      if (sensorCheckCounter % 10 === 0) {
+        console.log(`⚠️  Sensor mode DISABLED (sensor=false). Skipping threshold check.`);
+      }
+      return;
+    }
+
+    // Detect all threshold_* nodes
+    const allThresholds = Object.keys(kontrolConfig).filter(key => key.startsWith('threshold_'));
+
+    // Log sensor check (ALWAYS LOG untuk debugging)
+    console.log(`\n🌡️  SENSOR CHECK #${sensorCheckCounter} | Total Thresholds: ${allThresholds.length}`);
+    console.log(`   📊 Sensor Data:`, JSON.stringify(sensorData, null, 2));
+
+    if (allThresholds.length === 0) {
+      console.log('   ⚠️  No thresholds configured');
+      return;
+    }
+
+    // Process each threshold
+    for (const thresholdKey of allThresholds) {
+      const threshold = kontrolConfig[thresholdKey];
+      
+      console.log(`\n   🔍 Checking ${thresholdKey}:`);
+      console.log(`      Config:`, JSON.stringify(threshold, null, 2));
+      
+      // Skip if threshold is not active or invalid
+      if (!threshold || !threshold.aktif) {
+        console.log(`      ❌ Skipped: ${!threshold ? 'Not found' : 'Not active (aktif=false)'}`);
+        continue;
+      }
+
+      const batasBawah = threshold.batas_bawah || 30;
+      const batasAtas = threshold.batas_atas || 70;
+      const durasi = threshold.durasi || 600;
+      const smartMode = threshold.smart_mode === true;
+      const potAktif = threshold.pot_aktif || [];
+      const pompaAir = threshold.pompa_air === true;
+      const pompaPupuk = threshold.pompa_pupuk === true;
+
+      // Check each pot in this threshold
+      for (const potNumber of potAktif) {
+        if (potNumber < 1 || potNumber > 5) {
+          console.log(`      ⚠️  POT ${potNumber}: Invalid pot number (must be 1-5)`);
+          continue;
+        }
+
+        const soilKey = `soil_${potNumber}`;
+        const soilValue = parseInt(sensorData[soilKey]) || 0;
+
+        console.log(`      🌱 POT ${potNumber} (${soilKey}): ${soilValue}% | Threshold: ${batasBawah}-${batasAtas}%`);
+
+        // Check if below threshold
+        if (soilValue < batasBawah) {
+          const potKey = `pot_${potNumber}`;
+          const lastTime = lastWateringTime[potKey];
+
+          // Debounce: minimum 2 menit antar penyiraman
+          if (lastTime && Date.now() - lastTime < config.worker.sensorDebounce) {
+            const remainingSeconds = Math.ceil((config.worker.sensorDebounce - (Date.now() - lastTime)) / 1000);
+            console.log(`      ⏳ POT ${potNumber}: Cooldown active (${remainingSeconds}s remaining)`);
+            continue;
+          }
+
+          console.log(`\n🌡️ THRESHOLD TRIGGERED: ${thresholdKey.toUpperCase()}`);
+          console.log(`   POT ${potNumber}: ${soilValue}% < ${batasBawah}%`);
+          console.log(`   Mode: ${smartMode ? 'Smart' : 'Fixed'}, Target: ${smartMode ? batasAtas + '%' : durasi + 's'}`);
+          console.log(`   Pumps: Air=${pompaAir}, Pupuk=${pompaPupuk}`);
+
+          const jobId = `${thresholdKey}-pot-${potNumber}-${Date.now()}`;
+          await wateringQueue.add(
+            `threshold-pot-${potNumber}`,
+            {
+              type: 'sensor_threshold',
+              potNumbers: [potNumber],
+              pompaAir: pompaAir,
+              pompaPupuk: pompaPupuk,
+              duration: durasi,
+              scheduleId: jobId,
+              thresholdId: thresholdKey,
+              sensorData: { 
+                soilValue, 
+                batasBawah, 
+                batasAtas, 
+                mode: smartMode ? 'smart' : 'fixed' 
+              },
+            },
+            {
+              jobId,
+              removeOnComplete: true,
+              priority: 1, // Higher priority for sensor-triggered
+            }
+          );
+
+          console.log(`   📌 Added to queue: ${jobId}`);
+          
+          // Update last watering time to prevent rapid re-triggering
+          lastWateringTime[potKey] = Date.now();
+        } else {
+          console.log(`      ✅ POT ${potNumber}: OK (${soilValue}% >= ${batasBawah}%)`);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('❌ Error in sensor threshold check:', error.message);
+  }
+}
+
+// Setup sensor monitoring with BOTH listener (SDK) and polling (fallback)
 async function setupSensorMonitoring() {
   console.log('🌡️  ==================== SENSOR MODE ENABLED ====================');
   console.log('✅ Sensor Mode (Threshold System) monitoring started');
-  console.log('📍 Listening to Firebase path: /data');
+  console.log('📍 Primary: Polling every 30 seconds (REST API)');
+  console.log('📍 Backup: Firebase listener on /data (if SDK works)');
   console.log('📍 Config path: /' + FIREBASE_PATHS.kontrol);
   console.log('⏱️  Debounce time: 2 minutes between watering per pot');
   console.log('================================================================\n');
 
-  db.ref('data').on('value', async (snapshot) => {
-    sensorCheckCounter++;
-    
+  // METHOD 1: Polling (RELIABLE - uses REST API)
+  // Check sensor threshold every 30 seconds
+  setInterval(async () => {
     try {
-      const sensorData = snapshot.val();
-      if (!sensorData) {
-        console.log('⚠️  Sensor data is null/empty');
-        return;
-      }
-
-      const configSnapshot = await fetchWithTimeout(db.ref(FIREBASE_PATHS.kontrol), 10000);
-      const kontrolConfig = configSnapshot.val();
-
-      if (!kontrolConfig) {
-        return;
-      }
-
-      // Detect all threshold_* nodes
-      const allThresholds = Object.keys(kontrolConfig).filter(key => key.startsWith('threshold_'));
-
-      // Log sensor check (ALWAYS LOG untuk debugging)
-      console.log(`\n🌡️  SENSOR CHECK #${sensorCheckCounter} | Total Thresholds: ${allThresholds.length}`);
-      console.log(`   📊 Sensor Data:`, JSON.stringify(sensorData, null, 2));
-
-      if (allThresholds.length === 0) {
-        console.log('   ⚠️  No thresholds configured');
-        return;
-      }
-
-      // Process each threshold
-      for (const thresholdKey of allThresholds) {
-        const threshold = kontrolConfig[thresholdKey];
-        
-        console.log(`\n   🔍 Checking ${thresholdKey}:`);
-        console.log(`      Config:`, JSON.stringify(threshold, null, 2));
-        
-        // Skip if threshold is not active or invalid
-        if (!threshold || !threshold.aktif) {
-          console.log(`      ❌ Skipped: ${!threshold ? 'Not found' : 'Not active (aktif=false)'}`);
-          continue;
-        }
-
-        const batasBawah = threshold.batas_bawah || 30;
-        const batasAtas = threshold.batas_atas || 70;
-        const durasi = threshold.durasi || 600;
-        const smartMode = threshold.smart_mode === true;
-        const potAktif = threshold.pot_aktif || [];
-        const pompaAir = threshold.pompa_air === true;
-        const pompaPupuk = threshold.pompa_pupuk === true;
-
-        // Check each pot in this threshold
-        for (const potNumber of potAktif) {
-          if (potNumber < 1 || potNumber > 5) {
-            console.log(`      ⚠️  POT ${potNumber}: Invalid pot number (must be 1-5)`);
-            continue;
-          }
-
-          const soilKey = `soil_${potNumber}`;
-          const soilValue = parseInt(sensorData[soilKey]) || 0;
-
-          console.log(`      🌱 POT ${potNumber} (${soilKey}): ${soilValue}% | Threshold: ${batasBawah}-${batasAtas}%`);
-
-          // Check if below threshold
-          if (soilValue < batasBawah) {
-            const potKey = `pot_${potNumber}`;
-            const lastTime = lastWateringTime[potKey];
-
-            // Debounce: minimum 2 menit antar penyiraman
-            if (lastTime && Date.now() - lastTime < config.worker.sensorDebounce) {
-              const remainingSeconds = Math.ceil((config.worker.sensorDebounce - (Date.now() - lastTime)) / 1000);
-              console.log(`      ⏳ POT ${potNumber}: Cooldown active (${remainingSeconds}s remaining)`);
-              continue;
-            }
-
-            console.log(`\n🌡️ THRESHOLD TRIGGERED: ${thresholdKey.toUpperCase()}`);
-            console.log(`   POT ${potNumber}: ${soilValue}% < ${batasBawah}%`);
-            console.log(`   Mode: ${smartMode ? 'Smart' : 'Fixed'}, Target: ${smartMode ? batasAtas + '%' : durasi + 's'}`);
-            console.log(`   Pumps: Air=${pompaAir}, Pupuk=${pompaPupuk}`);
-
-            const jobId = `${thresholdKey}-pot-${potNumber}-${Date.now()}`;
-            await wateringQueue.add(
-              `threshold-pot-${potNumber}`,
-              {
-                type: 'sensor_threshold',
-                potNumbers: [potNumber],
-                pompaAir: pompaAir,
-                pompaPupuk: pompaPupuk,
-                duration: durasi,
-                scheduleId: jobId,
-                thresholdId: thresholdKey,
-                sensorData: { 
-                  soilValue, 
-                  batasBawah, 
-                  batasAtas, 
-                  mode: smartMode ? 'smart' : 'fixed' 
-                },
-              },
-              {
-                jobId,
-                removeOnComplete: true,
-                priority: 1, // Higher priority for sensor-triggered
-              }
-            );
-
-            console.log(`   📌 Added to queue: ${jobId}`);
-            
-            // Update last watering time to prevent rapid re-triggering
-            lastWateringTime[potKey] = Date.now();
-          } else {
-            console.log(`      ✅ POT ${potNumber}: OK (${soilValue}% >= ${batasBawah}%)`);
-          }
-        }
-      }
+      await checkSensorThresholds();
     } catch (error) {
-      console.error('❌ Error in threshold monitoring:', error.message);
+      console.error('❌ Polling sensor check failed:', error.message);
     }
-  });
+  }, 30000); // 30 seconds
+
+  // Run first check immediately
+  setTimeout(async () => {
+    console.log('🚀 Running first sensor check...');
+    try {
+      await checkSensorThresholds();
+      console.log('✅ First sensor check completed');
+    } catch (error) {
+      console.error('❌ First sensor check failed:', error.message);
+    }
+  }, 10000); // 10 seconds after startup
+
+  // METHOD 2: Firebase Listener (BACKUP - might not work if SDK fails)
+  try {
+    db.ref('data').on('value', async (snapshot) => {
+      console.log('🔔 Firebase listener triggered (SDK working!)');
+      // Call the same check function
+      await checkSensorThresholds();
+    }, (error) => {
+      console.error('❌ Firebase listener error:', error.message);
+    });
+    console.log('✅ Firebase listener attached (backup method)');
+  } catch (error) {
+    console.log('⚠️  Firebase listener failed to attach (will rely on polling)');
+  }
 }
 
 setupSensorMonitoring();
