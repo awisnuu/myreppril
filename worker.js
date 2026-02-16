@@ -40,6 +40,14 @@ const cron = require('cron');
 // Set timezone untuk Indonesia (UTC+7)
 process.env.TZ = process.env.TZ || 'Asia/Jakarta';
 
+// Firebase paths configuration
+const FIREBASE_PATHS = {
+  kontrol: 'kontrol_1',  // Main kontrol path (ubah ke 'kontrol' jika perlu)
+  aktuator: 'aktuator',
+  data: 'data',
+  history: 'history',
+};
+
 const config = {
   redis: {
     host: process.env.REDIS_HOST || 'localhost',
@@ -62,9 +70,10 @@ const config = {
 
 console.log('🚀 Starting ApsGo Railway Worker...');
 console.log(`📡 Firebase Project: ${config.firebase.projectId}`);
-console.log(`� Firebase DB URL: ${config.firebase.databaseURL}`);
-console.log(`�📦 Redis: ${config.redis.host}:${config.redis.port}`);
+console.log(`🔥 Firebase DB URL: ${config.firebase.databaseURL}`);
+console.log(`📦 Redis: ${config.redis.host}:${config.redis.port}`);
 console.log(`⏰ Timezone: ${process.env.TZ} (Current: ${new Date().toLocaleString('id-ID', {timeZone: 'Asia/Jakarta'})})`);
+console.log(`📍 Kontrol Path: /${FIREBASE_PATHS.kontrol}`);
 
 // ==================== ENVIRONMENT VALIDATION ====================
 
@@ -280,7 +289,7 @@ async function fetchWithTimeout2(url, options = {}, timeoutMs = 8000) {
 
 // Fallback: Fetch via Firebase REST API (lebih reliable)
 async function fetchKontrolViaREST() {
-  const url = `${config.firebase.databaseURL}/kontrol.json`;
+  const url = `${config.firebase.databaseURL}/${FIREBASE_PATHS.kontrol}.json`;
   console.log(`   [DEBUG] Trying REST API: ${url}`);
   
   const response = await fetchWithTimeout2(url, {
@@ -325,7 +334,7 @@ async function fetchKontrolSmart() {
   // Normal flow: Try SDK first
   try {
     console.log('   [DEBUG] Attempting SDK fetch...');
-    const snapshot = await fetchWithTimeout(db.ref('kontrol'), 5000);
+    const snapshot = await fetchWithTimeout(db.ref(FIREBASE_PATHS.kontrol), 5000);
     consecutiveFirebaseErrors = 0; // Reset error counter
     restFallbackCount = 0; // Reset fallback counter
     sdkSuccessCount++;
@@ -548,15 +557,34 @@ async function checkScheduledWatering() {
     // 🔍 VERBOSE LOG: Log setiap check untuk memastikan fungsi berjalan
     console.log(`\n⏱️  CHECK #${checkCounter}: ${currentTime}:${currentSeconds.toString().padStart(2, '0')} | Mode: ${kontrolConfig?.waktu ? '✅' : '❌'}`);
     
+    // Detect all schedules (jadwal_1, jadwal_2, jadwal_3, ...)
+    const allSchedules = kontrolConfig ? Object.keys(kontrolConfig).filter(key => key.startsWith('jadwal_')) : [];
+    
     // Log detail setiap 3 menit ATAU jika menit habis dibagi 5
     if (checkCounter % 3 === 0 || now.getMinutes() % 5 === 0) {
       console.log(`   📅 Date: ${dateKey}`);
       console.log(`   🕐 Current: ${currentTime} (${now.toLocaleString('id-ID', {timeZone: 'Asia/Jakarta'})})`);
       console.log(`   Mode Waktu: ${kontrolConfig?.waktu ? '✅ ENABLED' : '❌ DISABLED'}`);
       console.log(`   📊 API Stats: SDK=${sdkSuccessCount} | REST=${restFallbackCount} | Errors=${consecutiveFirebaseErrors}`);
-      if (kontrolConfig?.waktu) {
-        console.log(`   Jadwal 1: ${kontrolConfig.waktu_1 || 'not set'} ${kontrolConfig.waktu_1 === currentTime ? '🔔 MATCH!' : ''}`);
-        console.log(`   Jadwal 2: ${kontrolConfig.waktu_2 || 'not set'} ${kontrolConfig.waktu_2 === currentTime ? '🔔 MATCH!' : ''}`);
+      console.log(`   📋 Total Jadwal: ${allSchedules.length}`);
+      
+      if (kontrolConfig?.waktu && allSchedules.length > 0) {
+        allSchedules.forEach(scheduleKey => {
+          const schedule = kontrolConfig[scheduleKey];
+          if (schedule && typeof schedule === 'object') {
+            const isActive = schedule.aktif !== false; // Default true if not specified
+            const waktu = schedule.waktu || 'not set';
+            const potAktif = schedule.pot_aktif || [];
+            const isMatch = waktu === currentTime;
+            console.log(`   ${isActive ? '✅' : '❌'} ${scheduleKey}: ${waktu} → Pot [${potAktif.join(', ')}] ${isMatch ? '🔔 MATCH!' : ''}`);
+          }
+        });
+      }
+      
+      // Legacy support: Log old format if exists
+      if (kontrolConfig?.waktu_1 || kontrolConfig?.waktu_2) {
+        console.log(`   [LEGACY] waktu_1: ${kontrolConfig.waktu_1 || 'not set'}`);
+        console.log(`   [LEGACY] waktu_2: ${kontrolConfig.waktu_2 || 'not set'}`);
       }
     }
 
@@ -566,12 +594,88 @@ async function checkScheduledWatering() {
       return;
     }
 
+    // NEW: Dynamic schedule checking - supports jadwal_1, jadwal_2, ... jadwal_N
+    for (const scheduleKey of allSchedules) {
+      const schedule = kontrolConfig[scheduleKey];
+      
+      // Validate schedule structure
+      if (!schedule || typeof schedule !== 'object') {
+        console.log(`   ⚠️  ${scheduleKey}: Invalid structure, skipping`);
+        continue;
+      }
+      
+      // Check if schedule is active (default: true if not specified)
+      const isActive = schedule.aktif !== false;
+      if (!isActive) {
+        continue; // Skip disabled schedules
+      }
+      
+      // Check if time matches
+      const scheduleWaktu = schedule.waktu;
+      if (!scheduleWaktu || scheduleWaktu !== currentTime) {
+        continue; // Not time yet
+      }
+      
+      // Extract schedule config
+      const potAktif = schedule.pot_aktif || [];
+      const durasi = schedule.durasi || 60;
+      const pompaAir = schedule.pompa_air !== false; // Default true
+      const pompaPupuk = schedule.pompa_pupuk || false; // Default false
+      
+      // Validate pot_aktif
+      if (!Array.isArray(potAktif) || potAktif.length === 0) {
+        console.log(`   ⚠️  ${scheduleKey}: No active pots defined, skipping`);
+        continue;
+      }
+      
+      // Create unique job key
+      const jobKey = `${scheduleKey}_${dateKey}_${currentTime.replace(':', '_')}`;
+      
+      if (!lastScheduleCheck[jobKey]) {
+        console.log(`\n🕐 ${scheduleKey.toUpperCase()} TRIGGERED: ${currentTime}`);
+        console.log(`   🎯 Pot aktif: [${potAktif.join(', ')}]`);
+        console.log(`   ⏱️  Durasi: ${durasi}s`);
+        console.log(`   💧 Pompa Air: ${pompaAir ? 'ON' : 'OFF'}`);
+        console.log(`   🌿 Pompa Pupuk: ${pompaPupuk ? 'ON' : 'OFF'}`);
+
+        try {
+          await wateringQueue.add(
+            scheduleKey,
+            {
+              type: `waktu_${scheduleKey}`,
+              potNumbers: potAktif,
+              pompaAir: pompaAir,
+              pompaPupuk: pompaPupuk,
+              duration: durasi,
+              scheduleId: jobKey,
+            },
+            {
+              jobId: jobKey,
+              removeOnComplete: true,
+            }
+          );
+          
+          lastScheduleCheck[jobKey] = true;
+          console.log(`   ✅ Successfully added to queue: ${jobKey}`);
+          
+          // Check queue status
+          const queueStatus = await wateringQueue.getJobCounts();
+          console.log(`   📊 Queue status: ${queueStatus.active} active, ${queueStatus.waiting} waiting`);
+        } catch (queueError) {
+          console.error(`   ❌ Failed to add ${scheduleKey} to queue:`, queueError.message);
+        }
+      } else {
+        console.log(`   ⏭️  ${scheduleKey} already triggered: ${jobKey}`);
+      }
+    }
+    
+    // LEGACY SUPPORT: Check old format (waktu_1, waktu_2) untuk backward compatibility
     if (kontrolConfig.waktu_1 && kontrolConfig.waktu_1 === currentTime) {
-      const scheduleKey = `jadwal_1_${dateKey}_${currentTime.replace(':', '_')}`;
+      const scheduleKey = `legacy_jadwal_1_${dateKey}_${currentTime.replace(':', '_')}`;
 
       if (!lastScheduleCheck[scheduleKey]) {
-        console.log(`\n🕐 JADWAL 1 TRIGGERED: ${currentTime}`);
-        console.log(`   🎯 Attempting to add job to queue...`);
+        console.log(`\n🕐 [LEGACY] JADWAL 1 TRIGGERED: ${currentTime}`);
+        console.log(`   🎯 Using legacy format (all pots)`);
 
         try {
           await wateringQueue.add(
@@ -591,26 +695,19 @@ async function checkScheduledWatering() {
           );
           
           lastScheduleCheck[scheduleKey] = true;
-          console.log(`   ✅ Successfully added to queue: ${scheduleKey}`);
-          
-          // Check queue status
-          const queueStatus = await wateringQueue.getJobCounts();
-          console.log(`   📊 Queue status: ${queueStatus.active} active, ${queueStatus.waiting} waiting`);
+          console.log(`   ✅ Successfully added legacy jadwal_1 to queue`);
         } catch (queueError) {
-          console.error(`   ❌ Failed to add to queue:`, queueError.message);
+          console.error(`   ❌ Failed to add legacy jadwal_1:`, queueError.message);
         }
-      } else {
-        console.log(`   ⏭️  Jadwal 1 already triggered: ${scheduleKey}`);
       }
     }
 
-    // Check Jadwal 2
     if (kontrolConfig.waktu_2 && kontrolConfig.waktu_2 === currentTime) {
-      const scheduleKey = `jadwal_2_${dateKey}_${currentTime.replace(':', '_')}`;
+      const scheduleKey = `legacy_jadwal_2_${dateKey}_${currentTime.replace(':', '_')}`;
 
       if (!lastScheduleCheck[scheduleKey]) {
-        console.log(`\n🕑 JADWAL 2 TRIGGERED: ${currentTime}`);
-        console.log(`   🎯 Attempting to add job to queue...`);
+        console.log(`\n🕑 [LEGACY] JADWAL 2 TRIGGERED: ${currentTime}`);
+        console.log(`   🎯 Using legacy format (all pots)`);
 
         try {
           await wateringQueue.add(
@@ -630,16 +727,10 @@ async function checkScheduledWatering() {
           );
 
           lastScheduleCheck[scheduleKey] = true;
-          console.log(`   ✅ Successfully added to queue: ${scheduleKey}`);
-          
-          // Check queue status
-          const queueStatus = await wateringQueue.getJobCounts();
-          console.log(`   📊 Queue status: ${queueStatus.active} active, ${queueStatus.waiting} waiting`);
+          console.log(`   ✅ Successfully added legacy jadwal_2 to queue`);
         } catch (queueError) {
-          console.error(`   ❌ Failed to add to queue:`, queueError.message);
+          console.error(`   ❌ Failed to add legacy jadwal_2:`, queueError.message);
         }
-      } else {
-        console.log(`   ⏭️  Jadwal 2 already triggered: ${scheduleKey}`);
       }
     }
 
@@ -708,7 +799,7 @@ async function setupSensorMonitoring() {
         return;
       }
 
-      const configSnapshot = await fetchWithTimeout(db.ref('kontrol'), 10000);
+      const configSnapshot = await fetchWithTimeout(db.ref(FIREBASE_PATHS.kontrol), 10000);
       const kontrolConfig = configSnapshot.val();
 
       // Log sensor check (verbose hanya setiap 10 kali)
@@ -971,7 +1062,7 @@ async function showCurrentTime() {
     
     // Check Firebase kontrol waktu
     console.log('[DEBUG] Fetching kontrol for time analysis...');
-    const snapshot = await fetchWithTimeout(db.ref('kontrol'), 10000);
+    const snapshot = await fetchWithTimeout(db.ref(FIREBASE_PATHS.kontrol), 10000);
     const kontrolConfig = snapshot.val();
     console.log('[DEBUG] Kontrol fetch successful');
     
@@ -1090,11 +1181,11 @@ setTimeout(async () => {
   try {
     console.log('🔍 Verifying Firebase connection...');
     console.log('[DEBUG] Testing Firebase read with timeout...');
-    const snapshot = await fetchWithTimeout(db.ref('kontrol'), 10000);
+    const snapshot = await fetchWithTimeout(db.ref(FIREBASE_PATHS.kontrol), 10000);
     console.log('[DEBUG] Firebase read successful!');
     const data = snapshot.val();
     if (data) {
-      console.log('✅ Firebase /kontrol readable - waktu mode:', data.waktu ? 'ENABLED' : 'DISABLED');
+      console.log(`✅ Firebase /${FIREBASE_PATHS.kontrol} readable - waktu mode:`, data.waktu ? 'ENABLED' : 'DISABLED');
       if (data.waktu) {
         console.log(`   📅 Schedules: ${data.waktu_1 || 'none'} / ${data.waktu_2 || 'none'}`);
       }

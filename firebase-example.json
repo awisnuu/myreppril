@@ -1,0 +1,34 @@
+{
+  "kontrol": {
+    "waktu": true,
+    "sensor": false,
+    "otomatis": true,
+    
+    "jadwal_1": {
+      "aktif": true,
+      "waktu": "08:00",
+      "durasi": 60,
+      "pot_aktif": [1, 2, 3],
+      "pompa_air": true,
+      "pompa_pupuk": false
+    },
+    
+    "jadwal_2": {
+      "aktif": true,
+      "waktu": "09:00",
+      "durasi": 45,
+      "pot_aktif": [4, 5],
+      "pompa_air": true,
+      "pompa_pupuk": true
+    },
+    
+    "jadwal_3": {
+      "aktif": true,
+      "waktu": "16:00",
+      "durasi": 30,
+      "pot_aktif": [1, 2, 3, 4, 5],
+      "pompa_air": true,
+      "pompa_pupuk": true
+    }
+  }
+}
