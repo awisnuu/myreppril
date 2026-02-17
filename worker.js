@@ -807,10 +807,10 @@ async function checkSensorThresholds() {
       return;
     }
     
-    // Check if sensor mode is enabled
-    if (!kontrolConfig.sensor) {
+    // Check if sensor mode is enabled (using 'otomatis' field, not deprecated 'sensor')
+    if (!kontrolConfig.otomatis) {
       if (sensorCheckCounter % 10 === 0) {
-        console.log(`⚠️  Sensor mode DISABLED (sensor=false). Skipping threshold check.`);
+        console.log(`⚠️  Sensor mode DISABLED (otomatis=false). Skipping threshold check.`);
       }
       return;
     }
@@ -859,16 +859,19 @@ async function checkSensorThresholds() {
         const soilValue = parseInt(sensorData[soilKey]) || 0;
 
         console.log(`      🌱 POT ${potNumber} (${soilKey}): ${soilValue}% | Threshold: ${batasBawah}-${batasAtas}%`);
+        console.log(`         → Raw value: ${sensorData[soilKey]} | Parsed: ${soilValue} | Check: ${soilValue} < ${batasBawah} = ${soilValue < batasBawah}`);
 
         // Check if below threshold
         if (soilValue < batasBawah) {
           const potKey = `pot_${potNumber}`;
           const lastTime = lastWateringTime[potKey];
 
+          console.log(`      🚨 POT ${potNumber} KERING! ${soilValue}% < ${batasBawah}%`);
+          
           // Debounce: minimum 2 menit antar penyiraman
           if (lastTime && Date.now() - lastTime < config.worker.sensorDebounce) {
             const remainingSeconds = Math.ceil((config.worker.sensorDebounce - (Date.now() - lastTime)) / 1000);
-            console.log(`      ⏳ POT ${potNumber}: Cooldown active (${remainingSeconds}s remaining)`);
+            console.log(`      ⏳ POT ${potNumber}: Cooldown active (${remainingSeconds}s remaining) - skipping trigger`);
             continue;
           }
 
