@@ -133,15 +133,15 @@ const wateringQueue = new Queue('watering', { connection: redis });
 redis.on('connect', () => console.log('✅ Redis connected'));
 redis.on('error', (err) => console.error('❌ Redis error:', err.message));
 
-// Track last watering time untuk prevent spam
-const lastWateringTime = {};
+// Track last watering time PER-THRESHOLD (not per-pot!) untuk prevent spam
+const lastThresholdTime = {};
 
 // ==================== WATERING WORKER ====================
 
 const wateringWorker = new Worker(
   'watering',
   async (job) => {
-    const { type, potNumbers, pompaAir, pompaPupuk, duration, scheduleId, smartMode, sensorData } = job.data;
+    const { type, potNumbers, pompaAir, pompaPupuk, duration, scheduleId, thresholdId, smartMode, sensorData } = job.data;
 
     console.log(`\n💧 Processing Job: ${job.id}`);
     console.log(`   Type: ${type}`);
@@ -171,8 +171,9 @@ const wateringWorker = new Worker(
       console.log('   📝 Updates:', JSON.stringify(updates, null, 2));
       
       await updateFirebaseSmart('aktuator', updates);
+      console.log(`   🚀 ALL VALVES STARTED SIMULTANEOUSLY: ${Object.keys(updates).filter(k => k.startsWith('mosvet_')).join(', ')}`);
       
-      // SMART MODE: Monitor sensor and stop EACH POT INDEPENDENTLY when target reached
+      // SMART MODE: Monitor sensor and stop pots TOGETHER when they reach target
       if (smartMode && sensorData && sensorData.batasAtas) {
         const targetSoil = sensorData.batasAtas;
         const maxDuration = duration * 1000; // Convert to ms
@@ -181,11 +182,11 @@ const wateringWorker = new Worker(
         // Track which pots are still actively watering
         let activePots = [...potNumbers];
         
-        console.log(`   🎯 SMART MODE: Monitoring ${activePots.length} pots independently, target ${targetSoil}%...`);
-        console.log(`   ⚠️ Each pot will STOP IMMEDIATELY when it reaches target!`);
+        console.log(`   🎯 SMART MODE: Monitoring ${activePots.length} pots, target ${targetSoil}%...`);
+        console.log(`   ⚡ Valves will stop TOGETHER when pots reach target (checked every 2s)`);
         
         while (activePots.length > 0 && Date.now() - startTime < maxDuration) {
-          await sleep(2000); // Check every 2 seconds for faster response
+          await sleep(2000); // Check every 2 seconds
           
           try {
             const currentSensorData = await readFirebaseSmart('data');
@@ -194,29 +195,32 @@ const wateringWorker = new Worker(
               const elapsed = Math.floor((Date.now() - startTime) / 1000);
               const potsToStop = [];
               
-              // Check each active pot independently
+              // Check ALL active pots and collect which ones reached target
               for (const pot of activePots) {
                 const soilKey = `soil_${pot}`;
                 const currentValue = parseInt(currentSensorData[soilKey]) || 0;
                 
                 if (currentValue >= targetSoil) {
-                  console.log(`   ✅ [${elapsed}s] POT ${pot}: ${currentValue}% >= ${targetSoil}% - TARGET REACHED! STOPPING VALVE NOW!`);
+                  console.log(`   ✅ [${elapsed}s] POT ${pot}: ${currentValue}% >= ${targetSoil}% - TARGET REACHED!`);
                   potsToStop.push(pot);
-                  
-                  // IMMEDIATE STOP for this specific pot only
-                  const stopUpdate = {
-                    [`mosvet_${pot + 2}`]: false
-                  };
-                  await updateFirebaseSmart('aktuator', stopUpdate);
-                  console.log(`   🔴 POT ${pot} valve (mosvet_${pot + 2}) turned OFF`);
-                  
                 } else {
                   console.log(`   ⏳ [${elapsed}s] POT ${pot}: ${currentValue}% < ${targetSoil}% - continuing...`);
                 }
               }
               
-              // Remove stopped pots from active tracking list
-              activePots = activePots.filter(p => !potsToStop.includes(p));
+              // Stop ALL pots that reached target TOGETHER (not one-by-one!)
+              if (potsToStop.length > 0) {
+                const stopUpdates = {};
+                for (const pot of potsToStop) {
+                  stopUpdates[`mosvet_${pot + 2}`] = false;
+                }
+                
+                await updateFirebaseSmart('aktuator', stopUpdates);
+                console.log(`   🔴 STOPPED TOGETHER: ${Object.keys(stopUpdates).join(', ')} (Pots: [${potsToStop.join(', ')}])`);
+                
+                // Remove stopped pots from active list
+                activePots = activePots.filter(p => !potsToStop.includes(p));
+              }
               
               if (activePots.length === 0) {
                 console.log(`   🎉 All pots reached target! Smart watering complete.`);
@@ -229,16 +233,15 @@ const wateringWorker = new Worker(
           }
         }
         
-        // If any pots still active after max duration (timeout), stop them now
+        // If any pots still active after max duration (timeout), stop them now TOGETHER
         if (activePots.length > 0) {
           console.log(`   ⏱️ Max duration ${duration}s reached. Force stopping remaining pots: [${activePots.join(', ')}]`);
+          const timeoutStops = {};
           for (const pot of activePots) {
-            const stopUpdate = {
-              [`mosvet_${pot + 2}`]: false
-            };
-            await updateFirebaseSmart('aktuator', stopUpdate);
-            console.log(`   🔴 POT ${pot} valve force stopped (timeout)`);
+            timeoutStops[`mosvet_${pot + 2}`] = false;
           }
+          await updateFirebaseSmart('aktuator', timeoutStops);
+          console.log(`   🔴 Force stopped TOGETHER: ${Object.keys(timeoutStops).join(', ')}`);
         }
         
         // Finally, stop pumps
@@ -278,9 +281,10 @@ const wateringWorker = new Worker(
       await logHistory(type, potNumbers, duration);
       console.log('   ✅ History logged successfully');
 
-      // Update last watering time
-      for (const pot of potNumbers) {
-        lastWateringTime[`pot_${pot}`] = Date.now();
+      // Update last watering time PER-THRESHOLD (not per-pot!)
+      if (thresholdId) {
+        lastThresholdTime[thresholdId] = Date.now();
+        console.log(`   ⏰ Cooldown set for ${thresholdId} (2 minutes)`);
       }
 
       console.log(`   ✅ Job completed successfully`);
@@ -923,6 +927,14 @@ async function checkSensorThresholds() {
         continue;
       }
 
+      // Check THRESHOLD cooldown (not per-pot!)
+      const lastTime = lastThresholdTime[thresholdKey];
+      if (lastTime && Date.now() - lastTime < config.worker.sensorDebounce) {
+        const remainingSeconds = Math.ceil((config.worker.sensorDebounce - (Date.now() - lastTime)) / 1000);
+        console.log(`      ⏳ ${thresholdKey}: Cooldown active (${remainingSeconds}s remaining) - skipping entire threshold`);
+        continue;
+      }
+
       const batasBawah = threshold.batas_bawah || 30;
       const batasAtas = threshold.batas_atas || 70;
       const durasi = threshold.durasi || 600;
@@ -956,19 +968,9 @@ async function checkSensorThresholds() {
 
         // Check if below lower threshold
         if (soilValue < batasBawah) {
-          const potKey = `pot_${potNumber}`;
-          const lastTime = lastWateringTime[potKey];
-
           console.log(`      🚨 POT ${potNumber} KERING! ${soilValue}% < ${batasBawah}%`);
           
-          // Debounce: minimum 2 menit antar penyiraman
-          if (lastTime && Date.now() - lastTime < config.worker.sensorDebounce) {
-            const remainingSeconds = Math.ceil((config.worker.sensorDebounce - (Date.now() - lastTime)) / 1000);
-            console.log(`      ⏳ POT ${potNumber}: Cooldown active (${remainingSeconds}s remaining) - skipping trigger`);
-            continue;
-          }
-
-          // Add to watering list
+          // Add to watering list (cooldown already checked at threshold level)
           potsNeedWatering.push(potNumber);
           potDetails.push({ pot: potNumber, value: soilValue });
         } else {
@@ -1011,11 +1013,8 @@ async function checkSensorThresholds() {
         );
 
         console.log(`   📌 Added to queue: ${jobId}`);
-        
-        // Update last watering time for ALL pots
-        for (const potNumber of potsNeedWatering) {
-          lastWateringTime[`pot_${potNumber}`] = Date.now();
-        }
+        console.log(`   🔄 ${thresholdKey} will execute simultaneously for ALL pots`);
+        console.log(`   ⏰ After completion, ${thresholdKey} cooldown = 2 minutes (other thresholds can still run)`);
       }
     }
   } catch (error) {
