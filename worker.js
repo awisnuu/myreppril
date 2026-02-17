@@ -141,12 +141,16 @@ const lastWateringTime = {};
 const wateringWorker = new Worker(
   'watering',
   async (job) => {
-    const { type, potNumbers, pompaAir, pompaPupuk, duration, scheduleId } = job.data;
+    const { type, potNumbers, pompaAir, pompaPupuk, duration, scheduleId, smartMode, sensorData } = job.data;
 
     console.log(`\n💧 Processing Job: ${job.id}`);
     console.log(`   Type: ${type}`);
     console.log(`   Pots: [${potNumbers.join(', ')}]`);
-    console.log(`   Duration: ${duration}s`);
+    console.log(`   Mode: ${smartMode ? 'SMART (auto-stop at target)' : 'FIXED'}`);
+    console.log(`   Duration: ${duration}s ${smartMode ? '(max)' : ''}`);
+    if (sensorData) {
+      console.log(`   Target: ${sensorData.batasBawah}% → ${sensorData.batasAtas}%`);
+    }
 
     try {
       // Prepare aktuator updates
@@ -168,18 +172,71 @@ const wateringWorker = new Worker(
       
       await updateFirebaseSmart('aktuator', updates);
       
-      // (Verification skipped to avoid SDK timeout - update success already logged above)
-
-      // Wait for duration with progress logging
-      const startTime = Date.now();
-      const endTime = startTime + duration * 1000;
-
-      while (Date.now() < endTime) {
-        const remaining = Math.ceil((endTime - Date.now()) / 1000);
-        if (remaining % 10 === 0 || remaining <= 5) {
-          console.log(`   ⏳ ${remaining}s remaining...`);
+      // SMART MODE: Monitor sensor and stop when target reached
+      if (smartMode && sensorData && sensorData.batasAtas) {
+        const targetSoil = sensorData.batasAtas;
+        const maxDuration = duration * 1000; // Convert to ms
+        const startTime = Date.now();
+        let allPotsReachedTarget = false;
+        
+        console.log(`   🎯 SMART MODE: Monitoring until all pots reach ${targetSoil}%...`);
+        
+        while (Date.now() - startTime < maxDuration && !allPotsReachedTarget) {
+          const elapsed = Math.floor((Date.now() - startTime) / 1000);
+          const remaining = Math.ceil((maxDuration - (Date.now() - startTime)) / 1000);
+          
+          // Check sensor every 5 seconds
+          if (elapsed % 5 === 0) {
+            try {
+              const currentSensorData = await readFirebaseSmart('data');
+              
+              if (currentSensorData) {
+                const potStatus = [];
+                let allReached = true;
+                
+                for (const pot of potNumbers) {
+                  const soilKey = `soil_${pot}`;
+                  const currentValue = parseInt(currentSensorData[soilKey]) || 0;
+                  const reached = currentValue >= targetSoil;
+                  
+                  potStatus.push(`POT${pot}:${currentValue}%${reached ? '✅' : '⏳'}`);
+                  
+                  if (!reached) {
+                    allReached = false;
+                  }
+                }
+                
+                console.log(`   📊 [${elapsed}s] ${potStatus.join(', ')} | Max: ${remaining}s`);
+                
+                if (allReached) {
+                  allPotsReachedTarget = true;
+                  console.log(`   🎉 TARGET REACHED! All pots >= ${targetSoil}%. Stopping early.`);
+                  break;
+                }
+              }
+            } catch (sensorError) {
+              console.warn(`   ⚠️ Failed to read sensor: ${sensorError.message}`);
+            }
+          }
+          
+          await sleep(1000);
         }
-        await sleep(1000);
+        
+        if (!allPotsReachedTarget) {
+          console.log(`   ⏱️ Max duration reached (${duration}s). Stopping.`);
+        }
+      } else {
+        // FIXED MODE: Wait for fixed duration
+        const startTime = Date.now();
+        const endTime = startTime + duration * 1000;
+
+        while (Date.now() < endTime) {
+          const remaining = Math.ceil((endTime - Date.now()) / 1000);
+          if (remaining % 10 === 0 || remaining <= 5) {
+            console.log(`   ⏳ ${remaining}s remaining...`);
+          }
+          await sleep(1000);
+        }
       }
 
       // Turn OFF
@@ -848,6 +905,10 @@ async function checkSensorThresholds() {
       const pompaAir = threshold.pompa_air === true;
       const pompaPupuk = threshold.pompa_pupuk === true;
 
+      // Collect pots that need watering in this threshold
+      const potsNeedWatering = [];
+      const potDetails = [];
+
       // Check each pot in this threshold
       for (const potNumber of potAktif) {
         if (potNumber < 1 || potNumber > 5) {
@@ -861,7 +922,13 @@ async function checkSensorThresholds() {
         console.log(`      🌱 POT ${potNumber} (${soilKey}): ${soilValue}% | Threshold: ${batasBawah}-${batasAtas}%`);
         console.log(`         → Raw value: ${sensorData[soilKey]} | Parsed: ${soilValue} | Check: ${soilValue} < ${batasBawah} = ${soilValue < batasBawah}`);
 
-        // Check if below threshold
+        // NEW: Check if ABOVE upper threshold - skip if too wet!
+        if (soilValue >= batasAtas) {
+          console.log(`      ✅ POT ${potNumber}: SKIP (${soilValue}% >= ${batasAtas}% - sudah basah!)`);
+          continue;
+        }
+
+        // Check if below lower threshold
         if (soilValue < batasBawah) {
           const potKey = `pot_${potNumber}`;
           const lastTime = lastWateringTime[potKey];
@@ -875,42 +942,53 @@ async function checkSensorThresholds() {
             continue;
           }
 
-          console.log(`\n🌡️ THRESHOLD TRIGGERED: ${thresholdKey.toUpperCase()}`);
-          console.log(`   POT ${potNumber}: ${soilValue}% < ${batasBawah}%`);
-          console.log(`   Mode: ${smartMode ? 'Smart' : 'Fixed'}, Target: ${smartMode ? batasAtas + '%' : durasi + 's'}`);
-          console.log(`   Pumps: Air=${pompaAir}, Pupuk=${pompaPupuk}`);
-
-          const jobId = `${thresholdKey}-pot-${potNumber}-${Date.now()}`;
-          await wateringQueue.add(
-            `threshold-pot-${potNumber}`,
-            {
-              type: 'sensor_threshold',
-              potNumbers: [potNumber],
-              pompaAir: pompaAir,
-              pompaPupuk: pompaPupuk,
-              duration: durasi,
-              scheduleId: jobId,
-              thresholdId: thresholdKey,
-              sensorData: { 
-                soilValue, 
-                batasBawah, 
-                batasAtas, 
-                mode: smartMode ? 'smart' : 'fixed' 
-              },
-            },
-            {
-              jobId,
-              removeOnComplete: true,
-              priority: 1, // Higher priority for sensor-triggered
-            }
-          );
-
-          console.log(`   📌 Added to queue: ${jobId}`);
-          
-          // Update last watering time to prevent rapid re-triggering
-          lastWateringTime[potKey] = Date.now();
+          // Add to watering list
+          potsNeedWatering.push(potNumber);
+          potDetails.push({ pot: potNumber, value: soilValue });
         } else {
           console.log(`      ✅ POT ${potNumber}: OK (${soilValue}% >= ${batasBawah}%)`);
+        }
+      }
+
+      // NEW: Create SINGLE job for ALL pots that need watering in this threshold
+      if (potsNeedWatering.length > 0) {
+        console.log(`\n🌡️ THRESHOLD TRIGGERED: ${thresholdKey.toUpperCase()}`);
+        console.log(`   Pots needing water: [${potsNeedWatering.join(', ')}]`);
+        potDetails.forEach(p => console.log(`   - POT ${p.pot}: ${p.value}% < ${batasBawah}%`));
+        console.log(`   Mode: ${smartMode ? 'Smart (monitor until ' + batasAtas + '%)' : 'Fixed (' + durasi + 's)'}`);
+        console.log(`   Pumps: Air=${pompaAir}, Pupuk=${pompaPupuk}`);
+
+        const jobId = `${thresholdKey}-${Date.now()}`;
+        await wateringQueue.add(
+          thresholdKey,
+          {
+            type: 'sensor_threshold',
+            potNumbers: potsNeedWatering,  // ALL pots in 1 job!
+            pompaAir: pompaAir,
+            pompaPupuk: pompaPupuk,
+            duration: durasi,
+            scheduleId: jobId,
+            thresholdId: thresholdKey,
+            smartMode: smartMode,
+            sensorData: { 
+              batasBawah, 
+              batasAtas, 
+              mode: smartMode ? 'smart' : 'fixed',
+              potValues: potDetails
+            },
+          },
+          {
+            jobId,
+            removeOnComplete: true,
+            priority: 1, // Higher priority for sensor-triggered
+          }
+        );
+
+        console.log(`   📌 Added to queue: ${jobId}`);
+        
+        // Update last watering time for ALL pots
+        for (const potNumber of potsNeedWatering) {
+          lastWateringTime[`pot_${potNumber}`] = Date.now();
         }
       }
     }
