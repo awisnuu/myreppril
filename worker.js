@@ -172,59 +172,85 @@ const wateringWorker = new Worker(
       
       await updateFirebaseSmart('aktuator', updates);
       
-      // SMART MODE: Monitor sensor and stop when target reached
+      // SMART MODE: Monitor sensor and stop EACH POT INDEPENDENTLY when target reached
       if (smartMode && sensorData && sensorData.batasAtas) {
         const targetSoil = sensorData.batasAtas;
         const maxDuration = duration * 1000; // Convert to ms
         const startTime = Date.now();
-        let allPotsReachedTarget = false;
         
-        console.log(`   🎯 SMART MODE: Monitoring until all pots reach ${targetSoil}%...`);
+        // Track which pots are still actively watering
+        let activePots = [...potNumbers];
         
-        while (Date.now() - startTime < maxDuration && !allPotsReachedTarget) {
-          const elapsed = Math.floor((Date.now() - startTime) / 1000);
-          const remaining = Math.ceil((maxDuration - (Date.now() - startTime)) / 1000);
+        console.log(`   🎯 SMART MODE: Monitoring ${activePots.length} pots independently, target ${targetSoil}%...`);
+        console.log(`   ⚠️ Each pot will STOP IMMEDIATELY when it reaches target!`);
+        
+        while (activePots.length > 0 && Date.now() - startTime < maxDuration) {
+          await sleep(2000); // Check every 2 seconds for faster response
           
-          // Check sensor every 5 seconds
-          if (elapsed % 5 === 0) {
-            try {
-              const currentSensorData = await readFirebaseSmart('data');
+          try {
+            const currentSensorData = await readFirebaseSmart('data');
+            
+            if (currentSensorData) {
+              const elapsed = Math.floor((Date.now() - startTime) / 1000);
+              const potsToStop = [];
               
-              if (currentSensorData) {
-                const potStatus = [];
-                let allReached = true;
+              // Check each active pot independently
+              for (const pot of activePots) {
+                const soilKey = `soil_${pot}`;
+                const currentValue = parseInt(currentSensorData[soilKey]) || 0;
                 
-                for (const pot of potNumbers) {
-                  const soilKey = `soil_${pot}`;
-                  const currentValue = parseInt(currentSensorData[soilKey]) || 0;
-                  const reached = currentValue >= targetSoil;
+                if (currentValue >= targetSoil) {
+                  console.log(`   ✅ [${elapsed}s] POT ${pot}: ${currentValue}% >= ${targetSoil}% - TARGET REACHED! STOPPING VALVE NOW!`);
+                  potsToStop.push(pot);
                   
-                  potStatus.push(`POT${pot}:${currentValue}%${reached ? '✅' : '⏳'}`);
+                  // IMMEDIATE STOP for this specific pot only
+                  const stopUpdate = {
+                    [`mosvet_${pot + 2}`]: false
+                  };
+                  await updateFirebaseSmart('aktuator', stopUpdate);
+                  console.log(`   🔴 POT ${pot} valve (mosvet_${pot + 2}) turned OFF`);
                   
-                  if (!reached) {
-                    allReached = false;
-                  }
-                }
-                
-                console.log(`   📊 [${elapsed}s] ${potStatus.join(', ')} | Max: ${remaining}s`);
-                
-                if (allReached) {
-                  allPotsReachedTarget = true;
-                  console.log(`   🎉 TARGET REACHED! All pots >= ${targetSoil}%. Stopping early.`);
-                  break;
+                } else {
+                  console.log(`   ⏳ [${elapsed}s] POT ${pot}: ${currentValue}% < ${targetSoil}% - continuing...`);
                 }
               }
-            } catch (sensorError) {
-              console.warn(`   ⚠️ Failed to read sensor: ${sensorError.message}`);
+              
+              // Remove stopped pots from active tracking list
+              activePots = activePots.filter(p => !potsToStop.includes(p));
+              
+              if (activePots.length === 0) {
+                console.log(`   🎉 All pots reached target! Smart watering complete.`);
+              } else {
+                console.log(`   📍 Still watering: [${activePots.join(', ')}]`);
+              }
             }
+          } catch (sensorError) {
+            console.warn(`   ⚠️ Failed to read sensor: ${sensorError.message}`);
           }
-          
-          await sleep(1000);
         }
         
-        if (!allPotsReachedTarget) {
-          console.log(`   ⏱️ Max duration reached (${duration}s). Stopping.`);
+        // If any pots still active after max duration (timeout), stop them now
+        if (activePots.length > 0) {
+          console.log(`   ⏱️ Max duration ${duration}s reached. Force stopping remaining pots: [${activePots.join(', ')}]`);
+          for (const pot of activePots) {
+            const stopUpdate = {
+              [`mosvet_${pot + 2}`]: false
+            };
+            await updateFirebaseSmart('aktuator', stopUpdate);
+            console.log(`   🔴 POT ${pot} valve force stopped (timeout)`);
+          }
         }
+        
+        // Finally, stop pumps
+        const pumpStop = {};
+        if (pompaAir) pumpStop['mosvet_1'] = false;
+        if (pompaPupuk) pumpStop['mosvet_2'] = false;
+        if (Object.keys(pumpStop).length > 0) {
+          await updateFirebaseSmart('aktuator', pumpStop);
+          console.log('   🔴 Pumps stopped:', Object.keys(pumpStop).join(', '));
+        }
+        console.log('   ✅ Smart mode completed, now logging history...');
+        
       } else {
         // FIXED MODE: Wait for fixed duration
         const startTime = Date.now();
@@ -237,16 +263,16 @@ const wateringWorker = new Worker(
           }
           await sleep(1000);
         }
+        
+        // Turn OFF all at once (FIXED mode only)
+        const offUpdates = {};
+        for (const key in updates) {
+          offUpdates[key] = false;
+        }
+        console.log('   🔴 Turning OFF:', Object.keys(offUpdates).join(', '));
+        await updateFirebaseSmart('aktuator', offUpdates);
+        console.log('   ✅ Turn OFF completed, now logging history...');
       }
-
-      // Turn OFF
-      const offUpdates = {};
-      for (const key in updates) {
-        offUpdates[key] = false;
-      }
-      console.log('   🔴 Turning OFF:', Object.keys(offUpdates).join(', '));
-      await updateFirebaseSmart('aktuator', offUpdates);
-      console.log('   ✅ Turn OFF completed, now logging history...');
 
       // Log history
       await logHistory(type, potNumbers, duration);
